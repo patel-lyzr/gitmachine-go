@@ -1,0 +1,146 @@
+package gitmachine
+
+import "time"
+
+// MachineState represents the current lifecycle state of a Machine.
+type MachineState string
+
+const (
+	StateIdle    MachineState = "idle"
+	StateRunning MachineState = "running"
+	StatePaused  MachineState = "paused"
+	StateStopped MachineState = "stopped"
+)
+
+// ExecutionResult holds the output of a command execution.
+type ExecutionResult struct {
+	ExitCode int    `json:"exitCode"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+// LogEntry records a single command execution with its result and timestamp.
+type LogEntry struct {
+	Command   string          `json:"command"`
+	Result    ExecutionResult `json:"result"`
+	Timestamp time.Time       `json:"timestamp"`
+}
+
+// OnOutput is a callback invoked with stdout or stderr data as it streams.
+type OnOutput func(data string)
+
+// OnExit is a callback invoked when a command exits.
+type OnExit func(exitCode int)
+
+// OnEvent is a callback invoked on lifecycle events from GitMachine.
+type OnEvent func(event string, data map[string]interface{})
+
+// RunOptions configures a GitMachine.Run() call.
+type RunOptions struct {
+	// Cwd overrides the working directory for the command.
+	Cwd string
+
+	// Env provides additional environment variables for the command.
+	Env map[string]string
+
+	// Timeout in seconds. Zero means no timeout.
+	Timeout int
+
+	// OnStdout is called with stdout data as it streams.
+	OnStdout OnOutput
+
+	// OnStderr is called with stderr data as it streams.
+	OnStderr OnOutput
+
+	// OnExit is called when the command exits.
+	OnExit OnExit
+}
+
+// ExecuteOptions configures a Machine.Execute() call.
+type ExecuteOptions struct {
+	// Cwd overrides the working directory for the command.
+	Cwd string
+
+	// Env provides additional environment variables for the command.
+	Env map[string]string
+
+	// Timeout in seconds. Zero means no timeout.
+	Timeout int
+
+	// OnStdout is called with stdout data as it streams.
+	OnStdout OnOutput
+
+	// OnStderr is called with stderr data as it streams.
+	OnStderr OnOutput
+}
+
+// GitIdentity configures the git user identity for commits.
+type GitIdentity struct {
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	AvatarURL string `json:"avatarUrl,omitempty"`
+}
+
+// LifecycleHook is a callback invoked at lifecycle transitions of a GitMachine.
+type LifecycleHook func(gm *GitMachine) error
+
+// GitMachineConfig holds all configuration for constructing a GitMachine.
+type GitMachineConfig struct {
+	// Machine is the underlying VM provider (required).
+	Machine Machine
+
+	// Repository is the git repo URL, e.g. "https://github.com/user/repo.git" (required).
+	Repository string
+
+	// Token is a personal access token for git authentication (required).
+	Token string
+
+	// Identity configures the git user for commits. Defaults to GitMachine/gitagent@machine.
+	Identity *GitIdentity
+
+	// OnStart is called after the repo is cloned and ready.
+	OnStart LifecycleHook
+
+	// OnPause is called before the machine pauses.
+	OnPause LifecycleHook
+
+	// OnResume is called after the machine resumes.
+	OnResume LifecycleHook
+
+	// OnEnd is called before the machine stops.
+	OnEnd LifecycleHook
+
+	// Env provides environment variables for all commands.
+	Env map[string]string
+
+	// Timeout in seconds for command execution. Zero means no timeout.
+	Timeout int
+
+	// Session is the branch name for session persistence. Empty means use default branch.
+	Session string
+
+	// AutoCommit enables automatic commit on pause/stop. Defaults to true.
+	// Use a pointer to distinguish between "not set" (nil = true) and "explicitly false".
+	AutoCommit *bool
+
+	// OnEvent is called on lifecycle events (started, paused, resumed, etc.).
+	OnEvent func(event string, data map[string]interface{}, gm *GitMachine)
+}
+
+// E2BMachineConfig holds configuration for constructing an E2BMachine.
+type E2BMachineConfig struct {
+	// APIKey is the E2B API key. Falls back to E2B_API_KEY env var.
+	APIKey string
+
+	// Template is the sandbox template name. Defaults to "base".
+	Template string
+
+	// Timeout in seconds for the sandbox lifetime. Defaults to 300.
+	Timeout int
+
+	// Envs provides environment variables inside the sandbox.
+	Envs map[string]string
+
+	// Metadata attaches key-value metadata to the sandbox.
+	Metadata map[string]string
+}
