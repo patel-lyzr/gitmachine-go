@@ -47,9 +47,12 @@ func isAgentAvailable(node *gm.NodeRecord) bool {
 		resp.Body.Close()
 	}
 
-	agentCacheMu.Lock()
-	agentCache[node.ID] = available
-	agentCacheMu.Unlock()
+	// Only cache positive results — keep retrying if unreachable.
+	if available {
+		agentCacheMu.Lock()
+		agentCache[node.ID] = true
+		agentCacheMu.Unlock()
+	}
 
 	return available
 }
@@ -155,6 +158,42 @@ func agentExecInSandbox(node *gm.NodeRecord, sandboxID string, req execSandboxRe
 		return nil, fmt.Errorf("agent decode: %w", err)
 	}
 	return &result, nil
+}
+
+// agentListSandboxes lists sandboxes via the agent HTTP API.
+func agentListSandboxes(node *gm.NodeRecord) ([]agentSandboxInfo, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(agentURL(node) + "/sandbox")
+	if err != nil {
+		return nil, fmt.Errorf("agent list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		errBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("agent list: %s", strings.TrimSpace(string(errBody)))
+	}
+
+	var infos []agentSandboxInfo
+	if err := json.NewDecoder(resp.Body).Decode(&infos); err != nil {
+		return nil, fmt.Errorf("agent decode: %w", err)
+	}
+	return infos, nil
+}
+
+// agentStartSandbox starts a stopped sandbox via the agent HTTP API.
+func agentStartSandbox(node *gm.NodeRecord, sandboxID string) error {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	req, _ := http.NewRequest("POST", agentURL(node)+"/sandbox/"+sandboxID+"/start", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("agent start: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("agent start: status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // agentStopSandbox stops a sandbox via the agent HTTP API.

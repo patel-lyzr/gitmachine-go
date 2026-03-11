@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -28,6 +29,8 @@ import (
 )
 
 const defaultPort = 9420
+const sandboxDaemonBinary = "/usr/local/bin/gitmachine-sandbox-daemon"
+const sandboxDaemonPort = 9421
 
 // ---------- request / response types ----------
 
@@ -94,6 +97,7 @@ func main() {
 	mux.HandleFunc("GET /sandbox", handleList)
 	mux.HandleFunc("GET /sandbox/{id}", handleInspect)
 	mux.HandleFunc("POST /sandbox/{id}/exec", handleExec)
+	mux.HandleFunc("POST /sandbox/{id}/start", handleStart)
 	mux.HandleFunc("POST /sandbox/{id}/stop", handleStop)
 	mux.HandleFunc("DELETE /sandbox/{id}", handleRemove)
 
@@ -132,10 +136,20 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve ports.
+	// Resolve ports — always include daemon port.
 	ports := req.Ports
 	if len(ports) == 0 {
 		ports = defaultSandboxPorts
+	}
+	hasDaemonPort := false
+	for _, p := range ports {
+		if p == sandboxDaemonPort {
+			hasDaemonPort = true
+			break
+		}
+	}
+	if !hasDaemonPort {
+		ports = append(ports, sandboxDaemonPort)
 	}
 	usedPorts := getUsedHostPorts()
 	nextPort := 10000
@@ -182,8 +196,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	sandboxPorts[containerID] = mappings
 	mu.Unlock()
 
+	// Inject and start the sandbox daemon inside the container.
+	go injectSandboxDaemon(containerID)
+
+	shortID := containerID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+
 	writeJSON(w, sandboxInfo{
-		ID:     containerID,
+		ID:     shortID,
 		Name:   name,
 		Image:  image,
 		Status: "running",
@@ -192,7 +214,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
-	out, err := dockerRun("ps", "-a", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}")
+	out, err := dockerRun("ps", "-a", "--no-trunc", "--format", "{{.ID}}|{{.Names}}|{{.Image}}|{{.Status}}")
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "docker ps: "+out)
 		return
@@ -214,12 +236,18 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			status = "paused"
 		}
 
+		fullID := parts[0]
+		shortID := fullID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+
 		mu.RLock()
-		ports := sandboxPorts[parts[0]]
+		ports := sandboxPorts[fullID]
 		mu.RUnlock()
 
 		sandboxes = append(sandboxes, sandboxInfo{
-			ID:     parts[0],
+			ID:     shortID,
 			Name:   parts[1],
 			Image:  parts[2],
 			Status: status,
@@ -295,6 +323,23 @@ func handleExec(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func handleStart(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if out, err := dockerRun("start", id); err != nil {
+		httpError(w, http.StatusInternalServerError, "start: "+out)
+		return
+	}
+
+	// Re-inject the sandbox daemon since it won't survive a container stop/start.
+	fullID := id
+	if out, err := dockerRun("inspect", "--format", "{{.Id}}", id); err == nil {
+		fullID = strings.TrimSpace(out)
+	}
+	go injectSandboxDaemon(fullID)
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func handleStop(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if out, err := dockerRun("stop", id); err != nil {
@@ -323,6 +368,40 @@ func handleRemove(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------- sandbox daemon injection ----------
+
+// injectSandboxDaemon copies the sandbox daemon binary into a running container
+// and starts it in the background. This provides rich in-container APIs for
+// file operations, git, process sessions, etc.
+func injectSandboxDaemon(containerID string) {
+	// Check if daemon binary exists on host.
+	if _, err := os.Stat(sandboxDaemonBinary); err != nil {
+		log.Printf("sandbox-daemon: binary not found at %s, skipping injection", sandboxDaemonBinary)
+		return
+	}
+
+	// docker cp the binary into the container.
+	cpArgs := []string{"cp", sandboxDaemonBinary, containerID + ":/usr/local/bin/gitmachine-sandbox-daemon"}
+	if out, err := dockerRun(cpArgs...); err != nil {
+		log.Printf("sandbox-daemon: copy failed for %s: %s", containerID[:12], out)
+		return
+	}
+
+	// Make it executable.
+	if out, err := dockerRun("exec", containerID, "chmod", "+x", "/usr/local/bin/gitmachine-sandbox-daemon"); err != nil {
+		log.Printf("sandbox-daemon: chmod failed for %s: %s", containerID[:12], out)
+		return
+	}
+
+	// Start the daemon in the background inside the container.
+	if out, err := dockerRun("exec", "-d", containerID, "/usr/local/bin/gitmachine-sandbox-daemon"); err != nil {
+		log.Printf("sandbox-daemon: start failed for %s: %s", containerID[:12], out)
+		return
+	}
+
+	log.Printf("sandbox-daemon: injected into %s (port %d)", containerID[:12], sandboxDaemonPort)
 }
 
 // ---------- docker helpers ----------
@@ -424,6 +503,10 @@ func recoverExistingSandboxes() {
 		var mappings []portMapping
 		for _, chunk := range strings.Split(parts[1], ",") {
 			chunk = strings.TrimSpace(chunk)
+			// Skip IPv6 duplicates like "[::]:10000->22/tcp".
+			if strings.HasPrefix(chunk, "[") {
+				continue
+			}
 			// Parse "0.0.0.0:10000->8080/tcp"
 			arrow := strings.Index(chunk, "->")
 			if arrow < 0 {

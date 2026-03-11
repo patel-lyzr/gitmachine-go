@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -35,19 +37,20 @@ type nodeResponse struct {
 }
 
 type sandboxResponse struct {
-	ID        string           `json:"id"`
-	ShortID   string           `json:"short_id"`
-	Name      string           `json:"name"`
-	NodeID    string           `json:"node_id"`
-	NodeShort string           `json:"node_short"`
-	Image     string           `json:"image"`
-	CPUs      string           `json:"cpus,omitempty"`
-	Memory    string           `json:"memory,omitempty"`
-	DiskSize  string           `json:"disk_size,omitempty"`
-	Ports     []gm.PortMapping `json:"ports,omitempty"`
-	Status    string           `json:"status"`
-	Age       string           `json:"age"`
-	CreatedAt string           `json:"created_at"`
+	ID           string           `json:"id"`
+	ShortID      string           `json:"short_id"`
+	Name         string           `json:"name"`
+	NodeID       string           `json:"node_id"`
+	NodeShort    string           `json:"node_short"`
+	Image        string           `json:"image"`
+	CPUs         string           `json:"cpus,omitempty"`
+	Memory       string           `json:"memory,omitempty"`
+	DiskSize     string           `json:"disk_size,omitempty"`
+	Ports        []gm.PortMapping `json:"ports,omitempty"`
+	Status       string           `json:"status"`
+	DaemonStatus string           `json:"daemon_status"`
+	Age          string           `json:"age"`
+	CreatedAt    string           `json:"created_at"`
 }
 
 type credentialResponse struct {
@@ -81,6 +84,7 @@ func handleUI(args []string) {
 	mux.HandleFunc("POST /api/nodes", apiCreateNode)
 	mux.HandleFunc("GET /api/credentials", apiListCredentials)
 	mux.HandleFunc("GET /api/nodes/{id}/ssh", apiSSHWebSocket)
+	mux.HandleFunc("POST /api/nodes/{id}/deploy-agent", apiDeployAgent)
 
 	// Sandbox API routes.
 	mux.HandleFunc("GET /api/sandboxes", apiListSandboxes)
@@ -88,6 +92,7 @@ func handleUI(args []string) {
 	mux.HandleFunc("DELETE /api/sandboxes/{id}", apiDestroySandbox)
 	mux.HandleFunc("GET /api/sandboxes/{id}", apiGetSandbox)
 	mux.HandleFunc("POST /api/sandboxes/{id}/exec", apiExecSandbox)
+	mux.HandleFunc("POST /api/sandboxes/{id}/start", apiStartSandbox)
 	mux.HandleFunc("POST /api/sandboxes/{id}/stop", apiStopSandbox)
 	mux.HandleFunc("GET /api/sandboxes/{id}/ssh", apiSandboxSSHWebSocket)
 
@@ -103,10 +108,40 @@ func handleUI(args []string) {
 	fmt.Printf("Dashboard: %s\n", url)
 	openBrowser(url)
 
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	handler := logMiddleware(mux)
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// logMiddleware logs each HTTP request with method, path, status, and duration.
+func logMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		lw := &loggingResponseWriter{ResponseWriter: w, statusCode: 200}
+		next.ServeHTTP(lw, r)
+		duration := time.Since(start)
+		log.Printf("%s %s %d %s", r.Method, r.URL.Path, lw.statusCode, duration.Round(time.Millisecond))
+	})
+}
+
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lw *loggingResponseWriter) WriteHeader(code int) {
+	lw.statusCode = code
+	lw.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack implements http.Hijacker so WebSocket upgrades work through the middleware.
+func (lw *loggingResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := lw.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not support Hijack")
 }
 
 func openBrowser(url string) {
@@ -236,6 +271,34 @@ func apiStartNode(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func apiDeployAgent(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, node := resolveNodeAPI(w, id)
+	if node == nil {
+		return
+	}
+
+	if node.Status != "running" || node.PublicIP == "" {
+		httpError(w, http.StatusBadRequest, "node must be running with a public IP")
+		return
+	}
+
+	// Run deploy in background so we don't block the HTTP response.
+	nodeCopy := *node
+	go func() {
+		log.Printf("agent-deploy: manual deploy triggered for node %s (%s)", nodeCopy.ID, nodeCopy.PublicIP)
+		invalidateAgentCache(nodeCopy.ID)
+		if err := deployAgentToNode(&nodeCopy); err != nil {
+			log.Printf("agent-deploy: FAILED for node %s: %v", nodeCopy.ID, err)
+		} else {
+			log.Printf("agent-deploy: SUCCESS for node %s", nodeCopy.ID)
+			invalidateAgentCache(nodeCopy.ID)
+		}
+	}()
+
+	writeJSON(w, map[string]string{"status": "deploying"})
+}
+
 func apiDestroyNode(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	state, node := resolveNodeAPI(w, id)
@@ -252,9 +315,21 @@ func apiDestroyNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is the last node (to decide whether to clean up shared SG).
+	isLastNode := len(state.Nodes) <= 1
+	sgID := node.SecurityGrp
+
 	_ = provider.Terminate(ctx, node.ID)
 	state.RemoveKey(node.ID)
 	_ = state.Remove(node.ID)
+
+	// Delete shared security group if no more nodes remain.
+	if isLastNode && sgID != "" {
+		if ec2p, ok := provider.(*gm.EC2Provider); ok {
+			_ = ec2p.DeleteSecurityGroup(ctx, node.ID)
+		}
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -350,11 +425,22 @@ func apiCreateAWS(w http.ResponseWriter, r *http.Request, req createNodeRequest)
 		CreatedAt:    time.Now(),
 		Tags:         map[string]string{"Name": nodeName},
 	}
+
+	// Store AWS resource names for cleanup on destroy.
+	record.SSHKeyName = provider.CreatedKeyName()
+	record.SecurityGrp = provider.CreatedSGID()
+
 	_ = state.Add(record)
 
 	// Auto-deploy agent in background (don't block the response).
 	go func() {
-		_ = deployAgentToNode(&record)
+		log.Printf("agent-deploy: starting for node %s (%s)", record.ID, record.PublicIP)
+		if err := deployAgentToNode(&record); err != nil {
+			log.Printf("agent-deploy: FAILED for node %s: %v", record.ID, err)
+		} else {
+			log.Printf("agent-deploy: SUCCESS for node %s", record.ID)
+			invalidateAgentCache(record.ID)
+		}
 	}()
 
 	writeJSON(w, toNodeResponses([]gm.NodeRecord{record}))
@@ -387,6 +473,65 @@ func apiListSandboxes(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// Sync: pull sandbox list from each running node's agent and add any
+	// sandboxes that are missing from local state.
+	nstate, _ := gm.NewNodeState()
+	if nstate != nil {
+		for i := range nstate.Nodes {
+			node := &nstate.Nodes[i]
+			if node.Status != "running" || !isAgentAvailable(node) {
+				continue
+			}
+			remotes, err := agentListSandboxes(node)
+			if err != nil {
+				continue
+			}
+			for _, remote := range remotes {
+				existing := sstate.Find(remote.ID)
+				if existing == nil {
+					existing = sstate.FindByPrefix(remote.ID)
+				}
+				if existing == nil {
+					// Not tracked locally — add it.
+					var ports []gm.PortMapping
+					for _, p := range remote.Ports {
+						ports = append(ports, gm.PortMapping{
+							ContainerPort: p.ContainerPort,
+							HostPort:      p.HostPort,
+							URL:           p.URL,
+						})
+					}
+					_ = sstate.Add(gm.SandboxRecord{
+						ID:        remote.ID,
+						Name:      remote.Name,
+						NodeID:    node.ID,
+						Image:     remote.Image,
+						Status:    remote.Status,
+						Ports:     ports,
+						CreatedAt: time.Now(),
+					})
+				} else {
+					// Update status and ports from agent.
+					_ = sstate.Update(existing.ID, func(rec *gm.SandboxRecord) {
+						rec.Status = remote.Status
+						if len(rec.Ports) == 0 && len(remote.Ports) > 0 {
+							var ports []gm.PortMapping
+							for _, p := range remote.Ports {
+								ports = append(ports, gm.PortMapping{
+									ContainerPort: p.ContainerPort,
+									HostPort:      p.HostPort,
+									URL:           p.URL,
+								})
+							}
+							rec.Ports = ports
+						}
+					})
+				}
+			}
+		}
+	}
+
 	writeJSON(w, toSandboxResponses(sstate.Sandboxes))
 }
 
@@ -543,6 +688,32 @@ func apiCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, toSandboxResponses([]gm.SandboxRecord{rec}))
 }
 
+func apiStartSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sstate, rec := resolveSandboxAPI(w, id)
+	if rec == nil {
+		return
+	}
+
+	node := resolveNodeForSandboxAPI(w, rec.NodeID)
+	if node == nil {
+		return
+	}
+
+	if !isAgentAvailable(node) {
+		httpError(w, http.StatusServiceUnavailable, "agent not available on node "+node.ID)
+		return
+	}
+
+	if err := agentStartSandbox(node, rec.ID); err != nil {
+		httpError(w, http.StatusInternalServerError, "agent start: "+err.Error())
+		return
+	}
+
+	_ = sstate.Update(rec.ID, func(r *gm.SandboxRecord) { r.Status = "running" })
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func apiStopSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	sstate, rec := resolveSandboxAPI(w, id)
@@ -610,6 +781,7 @@ func apiSandboxSSHWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find the parent node.
+	log.Printf("sandbox-ssh: lookup node for sandbox %s (nodeID=%s)", rec.ID, rec.NodeID)
 	nstate, err := gm.NewNodeState()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -692,7 +864,9 @@ func apiSandboxSSHWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Start a shell running docker exec into the container.
 	dockerExecCmd := fmt.Sprintf("sudo docker exec -it %s /bin/bash || sudo docker exec -it %s /bin/sh", rec.ID, rec.ID)
+	log.Printf("sandbox-ssh: starting docker exec for %s on %s", rec.ID, node.PublicIP)
 	if err := session.Start(dockerExecCmd); err != nil {
+		log.Printf("sandbox-ssh: docker exec start failed: %v", err)
 		session.Close()
 		sshClient.Close()
 		http.Error(w, "docker exec failed: "+err.Error(), http.StatusBadGateway)
@@ -817,20 +991,41 @@ func toSandboxResponses(sandboxes []gm.SandboxRecord) []sandboxResponse {
 		if len(nid) > 12 {
 			nid = nid[:12]
 		}
+		// Check sandbox daemon status by probing port 9421.
+		daemonStatus := "unknown"
+		if s.Status == "running" {
+			daemonStatus = "unreachable"
+			for _, p := range s.Ports {
+				if p.ContainerPort == 9421 && p.URL != "" {
+					client := &http.Client{Timeout: 2 * time.Second}
+					if resp, err := client.Get(p.URL + "/health"); err == nil {
+						resp.Body.Close()
+						if resp.StatusCode == http.StatusOK {
+							daemonStatus = "running"
+						}
+					}
+					break
+				}
+			}
+		} else {
+			daemonStatus = "stopped"
+		}
+
 		out[i] = sandboxResponse{
-			ID:        s.ID,
-			ShortID:   sid,
-			Name:      s.Name,
-			NodeID:    s.NodeID,
-			NodeShort: nid,
-			Image:     s.Image,
-			CPUs:      s.CPUs,
-			Memory:    s.Memory,
-			DiskSize:  s.DiskSize,
-			Ports:     s.Ports,
-			Status:    s.Status,
-			Age:       formatAge(time.Since(s.CreatedAt)),
-			CreatedAt: s.CreatedAt.Format(time.RFC3339),
+			ID:           s.ID,
+			ShortID:      sid,
+			Name:         s.Name,
+			NodeID:       s.NodeID,
+			NodeShort:    nid,
+			Image:        s.Image,
+			CPUs:         s.CPUs,
+			Memory:       s.Memory,
+			DiskSize:     s.DiskSize,
+			Ports:        s.Ports,
+			Status:       s.Status,
+			DaemonStatus: daemonStatus,
+			Age:          formatAge(time.Since(s.CreatedAt)),
+			CreatedAt:    s.CreatedAt.Format(time.RFC3339),
 		}
 	}
 	return out
@@ -876,7 +1071,10 @@ func providerForNodeAPI(node *gm.NodeRecord) (gm.CloudProvider, error) {
 		if node.SSHUser != "" {
 			config.SSHUser = node.SSHUser
 		}
-		return gm.NewEC2Provider(config), nil
+		p := gm.NewEC2Provider(config)
+		// Restore resource names so Terminate can clean up key pairs and SGs.
+		p.SetCleanupInfo(node.SSHKeyName, node.SecurityGrp)
+		return p, nil
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", node.Provider)
 	}

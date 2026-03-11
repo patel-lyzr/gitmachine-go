@@ -17,6 +17,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.12.2 // indirect
 	github.com/aws/aws-sdk-go-v2/service/internal/presigned-url v1.12.13 // indirect
 	github.com/aws/smithy-go v1.22.2 // indirect
+	github.com/creack/pty v1.1.24 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	golang.org/x/sys v0.29.0 // indirect
 )

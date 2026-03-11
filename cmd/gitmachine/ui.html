@@ -338,6 +338,8 @@ function renderNodes() {
       <div class="card-actions">
         ${n.status === 'running' ? `<button class="btn btn-purple" onclick="openSSH('${esc(n.id)}','${esc(n.name || 'gitmachine')}')" ${isSSH ? 'disabled' : ''}>
           ${isSSH ? 'SSH Active' : 'SSH'}</button>` : ''}
+        ${n.status === 'running' && n.agent_status !== 'running' ? `<button class="btn btn-green" onclick="deployAgent('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'deploy-agent' ? '<span class="spinner"></span>' : 'Deploy Agent'}</button>` : ''}
         <button class="btn btn-blue" onclick="refreshNode('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
           ${isLoading === 'refresh' ? '<span class="spinner"></span>' : 'Refresh'}
         </button>
@@ -427,6 +429,26 @@ async function startNode(id) {
     await fetchAll();
   } catch (e) { showToast('Start failed: ' + e.message); }
   delete loading[id]; renderNodes();
+}
+
+async function deployAgent(id) {
+  loading[id] = 'deploy-agent'; renderNodes();
+  try {
+    await api('POST', `/api/nodes/${encodeURIComponent(id)}/deploy-agent`);
+    showToast('Agent deploying... this may take ~60s', true);
+    // Poll until agent becomes available.
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      await fetchAll();
+      const node = nodes.find(n => n.id === id);
+      if ((node && node.agent_status === 'running') || attempts > 30) {
+        clearInterval(poll);
+        delete loading[id]; renderNodes();
+        if (node && node.agent_status === 'running') showToast('Agent deployed!', true);
+      }
+    }, 5000);
+  } catch (e) { showToast('Deploy failed: ' + e.message); delete loading[id]; renderNodes(); }
 }
 
 async function destroyNode(id) {
@@ -657,6 +679,7 @@ function renderSandboxes() {
       <div class="card-details">
         <div class="detail"><span class="label">Image</span><br><span class="value">${esc(s.image)}</span></div>
         <div class="detail"><span class="label">Node</span><br><span class="value">${esc(s.node_short)}</span></div>
+        <div class="detail"><span class="label">Daemon</span><br><span class="value"><span class="badge ${s.daemon_status === 'running' ? 'badge-running' : s.daemon_status === 'unreachable' ? 'badge-unknown' : 'badge-stopped'}" style="font-size:0.7rem;padding:2px 6px">${esc(s.daemon_status)}</span></span></div>
         ${s.cpus || s.memory || s.disk_size ? `<div class="detail"><span class="label">Resources</span><br><span class="value">${[s.cpus ? s.cpus + ' CPU' : '', s.memory ? s.memory + ' RAM' : '', s.disk_size ? s.disk_size + ' disk' : ''].filter(Boolean).join(', ')}</span></div>` : ''}
         <div class="detail"><span class="label">Age</span><br><span class="value">${esc(s.age)}</span></div>
       </div>
@@ -668,6 +691,8 @@ function renderSandboxes() {
           ${isSSH ? 'SSH Active' : 'SSH'}</button>` : ''}
         ${s.status === 'running' ? `<button class="btn" onclick="stopSandbox('${esc(s.id)}')" ${isLoading ? 'disabled' : ''}>
           ${isLoading === 'stop' ? '<span class="spinner"></span>' : 'Stop'}</button>` : ''}
+        ${s.status === 'stopped' ? `<button class="btn btn-green" onclick="startSandbox('${esc(s.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'start' ? '<span class="spinner"></span>' : 'Start'}</button>` : ''}
         <button class="btn btn-danger" onclick="destroySandbox('${esc(s.id)}')" ${isLoading ? 'disabled' : ''}>
           ${isLoading === 'destroy' ? '<span class="spinner"></span>' : 'Remove'}
         </button>
@@ -731,6 +756,15 @@ async function createSandbox() {
   btn.disabled = false;
   btn.textContent = 'Create';
   renderSandboxes();
+}
+
+async function startSandbox(id) {
+  loading['sb-' + id] = 'start'; renderSandboxes();
+  try {
+    await api('POST', `/api/sandboxes/${encodeURIComponent(id)}/start`);
+    await fetchAll();
+  } catch (e) { showToast('Start sandbox failed: ' + e.message); }
+  delete loading['sb-' + id]; renderSandboxes();
 }
 
 async function stopSandbox(id) {

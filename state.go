@@ -19,6 +19,8 @@ type NodeRecord struct {
 	PublicIP     string            `json:"public_ip"`
 	SSHUser      string            `json:"ssh_user"`
 	SSHKeyPath   string            `json:"ssh_key_path"`
+	SSHKeyName   string            `json:"ssh_key_name,omitempty"`
+	SecurityGrp  string            `json:"security_group,omitempty"`
 	Status       string            `json:"status"`
 	CreatedAt    time.Time         `json:"created_at"`
 	Tags         map[string]string `json:"tags,omitempty"`

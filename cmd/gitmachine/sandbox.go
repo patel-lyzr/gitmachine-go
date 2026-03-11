@@ -25,6 +25,8 @@ func handleSandbox(args []string) {
 		sandboxStatus(rest)
 	case "exec":
 		sandboxExec(rest)
+	case "start":
+		sandboxStart(rest)
 	case "stop":
 		sandboxStop(rest)
 	case "remove", "rm":
@@ -290,6 +292,43 @@ func sandboxExec(args []string) {
 	}
 }
 
+func sandboxStart(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: gitmachine sandbox start <sandbox-id>")
+		os.Exit(1)
+	}
+
+	sstate, rec := resolveSandbox(args[0])
+	_, node := resolveNode(rec.NodeID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cloudMachine, err := connectToNode(ctx, node)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to node: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Starting sandbox %s...", shortID(rec.ID))
+
+	startCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker start %s", rec.ID))
+	result, err := cloudMachine.Execute(ctx, startCmd, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nFailed: %v\n", err)
+		os.Exit(1)
+	}
+	if result.ExitCode != 0 {
+		fmt.Fprintf(os.Stderr, "\nFailed: %s\n", result.Stderr)
+		os.Exit(1)
+	}
+
+	_ = sstate.Update(rec.ID, func(r *gm.SandboxRecord) {
+		r.Status = "running"
+	})
+	fmt.Println(" done!")
+}
+
 func sandboxStop(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: gitmachine sandbox stop <sandbox-id>")
@@ -509,6 +548,7 @@ func printSandboxUsage() {
 	fmt.Println("  list [node-id]           List sandboxes (optionally filter by node)")
 	fmt.Println("  status <sandbox-id>      Show sandbox status")
 	fmt.Println("  exec <sandbox-id> <cmd>  Execute a command in a sandbox")
+	fmt.Println("  start <sandbox-id>       Start a stopped sandbox")
 	fmt.Println("  stop <sandbox-id>        Stop a sandbox")
 	fmt.Println("  rm <sandbox-id>          Remove a sandbox")
 	fmt.Println("  ssh <sandbox-id>         SSH into a sandbox")

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -457,6 +458,11 @@ func createAWS(ctx context.Context, instanceType, region, ami, sshUser, name, ac
 			CreatedAt:    time.Now(),
 			Tags:         map[string]string{"Name": nodeName},
 		}
+
+		// Store AWS resource names for cleanup on destroy.
+		record.SSHKeyName = provider.CreatedKeyName()
+		record.SecurityGrp = provider.CreatedSGID()
+
 		_ = state.Add(record)
 	}
 
@@ -623,6 +629,10 @@ func nodeDestroy(args []string) {
 	provider := providerForNode(node)
 	fmt.Printf("Destroying %s...", node.ID)
 
+	// Check if this is the last node (to decide whether to clean up shared SG).
+	isLastNode := len(state.Nodes) <= 1
+	sgID := node.SecurityGrp
+
 	if err := provider.Terminate(ctx, node.ID); err != nil {
 		fmt.Fprintf(os.Stderr, "\nFailed: %v\n", err)
 		os.Exit(1)
@@ -630,6 +640,13 @@ func nodeDestroy(args []string) {
 
 	state.RemoveKey(node.ID)
 	_ = state.Remove(node.ID)
+
+	// Delete shared security group if no more nodes remain.
+	if isLastNode && sgID != "" {
+		if ec2p, ok := provider.(*gm.EC2Provider); ok {
+			_ = ec2p.DeleteSecurityGroup(ctx, node.ID)
+		}
+	}
 
 	// Clean up orphaned sandbox records for this node.
 	if sstate, err := gm.NewSandboxState(); err == nil {
@@ -689,6 +706,25 @@ func deployAgentToNode(node *gm.NodeRecord) error {
 		sshUser = "ubuntu"
 	}
 
+	// Wait for SSH to become available (fresh EC2 instances take 30-60s).
+	sshBase := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=5"}
+	if node.SSHKeyPath != "" {
+		sshBase = append(sshBase, "-i", node.SSHKeyPath)
+	}
+	dest := fmt.Sprintf("%s@%s", sshUser, node.PublicIP)
+	for attempt := 1; attempt <= 12; attempt++ {
+		waitArgs := append(append([]string{}, sshBase...), dest, "echo ready")
+		waitCmd := execCommand("ssh", waitArgs...)
+		if out, err := waitCmd.CombinedOutput(); err == nil && strings.Contains(string(out), "ready") {
+			break
+		}
+		if attempt == 12 {
+			return fmt.Errorf("SSH not available after 60s")
+		}
+		log.Printf("agent-deploy: waiting for SSH on %s (attempt %d/12)...", node.PublicIP, attempt)
+		time.Sleep(5 * time.Second)
+	}
+
 	// Check if agent is already running.
 	checkArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=5"}
 	if node.SSHKeyPath != "" {
@@ -715,24 +751,36 @@ func deployAgentToNode(node *gm.NodeRecord) error {
 
 	// Need to build and upload.
 	agentBinary := "/tmp/gitmachine-agent-linux"
-	buildCmd := execCommand("go", "build", "-o", agentBinary, "./cmd/gitmachine-agent")
-	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
-	if out, err := buildCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("build: %s (%w)", string(out), err)
+	daemonBinary := "/tmp/gitmachine-sandbox-daemon-linux"
+
+	// Build both binaries for linux/amd64.
+	log.Printf("agent-deploy: building binaries...")
+	buildAgent := execCommand("go", "build", "-o", agentBinary, "./cmd/gitmachine-agent")
+	buildAgent.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
+	buildDaemon := execCommand("go", "build", "-o", daemonBinary, "./cmd/gitmachine-sandbox-daemon")
+	buildDaemon.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
+
+	if out, err := buildAgent.CombinedOutput(); err != nil {
+		return fmt.Errorf("build agent: %s (%w)", string(out), err)
+	}
+	if out, err := buildDaemon.CombinedOutput(); err != nil {
+		return fmt.Errorf("build sandbox-daemon: %s (%w)", string(out), err)
+	}
+	log.Printf("agent-deploy: binaries built, uploading via SCP...")
+
+	// SCP upload both binaries.
+	sshOpts := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	if node.SSHKeyPath != "" {
+		sshOpts = append(sshOpts, "-i", node.SSHKeyPath)
 	}
 
-	// SCP upload.
-	scpArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
-	if node.SSHKeyPath != "" {
-		scpArgs = append(scpArgs, "-i", node.SSHKeyPath)
-	}
-	scpArgs = append(scpArgs, agentBinary, fmt.Sprintf("%s@%s:/tmp/gitmachine-agent", sshUser, node.PublicIP))
+	scpArgs := append(append([]string{}, sshOpts...), agentBinary, daemonBinary, dest+":/tmp/")
 	scpCmd := execCommand("scp", scpArgs...)
 	if out, err := scpCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("scp: %s (%w)", string(out), err)
 	}
 
-	// Install Docker (if needed) + agent as a systemd service.
+	// Install Docker (if needed) + agent + sandbox-daemon as a systemd service.
 	installScript := `#!/bin/bash
 set -e
 
@@ -745,9 +793,13 @@ if ! command -v docker &>/dev/null; then
 fi
 
 # Install agent binary.
-sudo mv /tmp/gitmachine-agent /usr/local/bin/gitmachine-agent
+sudo mv /tmp/gitmachine-agent-linux /usr/local/bin/gitmachine-agent
 sudo chmod +x /usr/local/bin/gitmachine-agent
 sudo pkill gitmachine-agent 2>/dev/null || true
+
+# Install sandbox daemon binary (used inside containers).
+sudo mv /tmp/gitmachine-sandbox-daemon-linux /usr/local/bin/gitmachine-sandbox-daemon
+sudo chmod +x /usr/local/bin/gitmachine-sandbox-daemon
 
 # Create systemd service.
 sudo tee /etc/systemd/system/gitmachine-agent.service > /dev/null << 'UNIT'
@@ -774,6 +826,7 @@ echo "Agent started."`
 		sshArgs = append(sshArgs, "-i", node.SSHKeyPath)
 	}
 	sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, node.PublicIP), installScript)
+	log.Printf("agent-deploy: running install script on %s...", node.PublicIP)
 	sshCmd := execCommand("ssh", sshArgs...)
 	if out, err := sshCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("install: %s (%w)", string(out), err)
@@ -781,6 +834,7 @@ echo "Agent started."`
 
 	// Wait briefly for the service to start.
 	time.Sleep(2 * time.Second)
+	log.Printf("agent-deploy: install complete on %s", node.PublicIP)
 	return nil
 }
 
@@ -856,7 +910,10 @@ func providerForNode(node *gm.NodeRecord) gm.CloudProvider {
 		if node.SSHUser != "" {
 			config.SSHUser = node.SSHUser
 		}
-		return gm.NewEC2Provider(config)
+		p := gm.NewEC2Provider(config)
+		// Restore resource names so Terminate can clean up key pairs and SGs.
+		p.SetCleanupInfo(node.SSHKeyName, node.SecurityGrp)
+		return p
 	default:
 		fmt.Fprintf(os.Stderr, "unsupported provider: %s\n", node.Provider)
 		os.Exit(1)

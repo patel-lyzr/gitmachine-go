@@ -39,8 +39,9 @@ type EC2Provider struct {
 	sshUser      string
 	tags         map[string]string
 
-	// Track temporary key pair for cleanup.
+	// Track temporary resources for cleanup on Terminate.
 	createdKeyName string
+	createdSGID    string
 }
 
 // NewEC2Provider creates a new AWS EC2 cloud provider.
@@ -110,6 +111,18 @@ func NewEC2Provider(config *EC2MachineConfig) *EC2Provider {
 }
 
 func (p *EC2Provider) Name() string { return "aws" }
+
+// CreatedKeyName returns the key pair name created during Launch.
+func (p *EC2Provider) CreatedKeyName() string { return p.createdKeyName }
+
+// CreatedSGID returns the security group ID created during Launch.
+func (p *EC2Provider) CreatedSGID() string { return p.createdSGID }
+
+// SetCleanupInfo restores resource names from persisted state so Terminate can clean them up.
+func (p *EC2Provider) SetCleanupInfo(keyName string, sgID string) {
+	p.createdKeyName = keyName
+	p.createdSGID = sgID
+}
 
 func (p *EC2Provider) Launch(ctx context.Context) (*CloudInstance, error) {
 	// Create temporary key pair if none provided.
@@ -210,7 +223,7 @@ func (p *EC2Provider) Terminate(ctx context.Context, id string) error {
 		_ = err // best effort
 	}
 
-	// Clean up temporary key pair (SG is shared and kept).
+	// Clean up temporary key pair.
 	if p.createdKeyName != "" {
 		_, _ = p.ec2Client.DeleteKeyPair(ctx, &ec2.DeleteKeyPairInput{
 			KeyName: aws.String(p.createdKeyName),
@@ -218,6 +231,20 @@ func (p *EC2Provider) Terminate(ctx context.Context, id string) error {
 	}
 
 	return nil
+}
+
+// DeleteSecurityGroup deletes the tracked security group. Call only when no
+// other instances reference it (i.e. this is the last node being destroyed).
+func (p *EC2Provider) DeleteSecurityGroup(ctx context.Context, instanceID string) error {
+	if p.createdSGID == "" {
+		return nil
+	}
+	// Wait for instance to fully terminate so the SG is no longer referenced.
+	_ = p.waitForState(ctx, instanceID, ec2types.InstanceStateNameTerminated)
+	_, err := p.ec2Client.DeleteSecurityGroup(ctx, &ec2.DeleteSecurityGroupInput{
+		GroupId: aws.String(p.createdSGID),
+	})
+	return err
 }
 
 func (p *EC2Provider) Describe(ctx context.Context, id string) (*CloudInstance, error) {
@@ -319,6 +346,7 @@ func (p *EC2Provider) createSecurityGroup(ctx context.Context) error {
 	if err == nil && len(desc.SecurityGroups) > 0 {
 		sgID := *desc.SecurityGroups[0].GroupId
 		p.sgIDs = []string{sgID}
+		p.createdSGID = sgID // Track for cleanup when last node is destroyed.
 
 		// Ensure agent port (9420) is open — may be missing on older SGs.
 		_, _ = p.ec2Client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
@@ -382,7 +410,8 @@ func (p *EC2Provider) createSecurityGroup(ctx context.Context) error {
 	}
 
 	p.sgIDs = []string{sgID}
-	// Not marked as createdSGID — shared SG persists across nodes.
+	// Track even the shared SG so we can clean it up when the last node is destroyed.
+	p.createdSGID = sgID
 	return nil
 }
 
