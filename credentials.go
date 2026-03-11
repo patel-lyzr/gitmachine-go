@@ -15,7 +15,7 @@ type CloudCredential struct {
 	Name string `json:"name"`
 
 	// Provider is the cloud type: "aws", "azure", "gcp".
-go	Provider string `json:"provider"`
+	Provider string `json:"provider"`
 
 	// Fields holds provider-specific credential key-value pairs.
 	// AWS: access_key_id, secret_access_key, region

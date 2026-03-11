@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>gitmachine</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: #0d1117; color: #c9d1d9; line-height: 1.5;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid #21262d;
+  }
+  header h1 { font-size: 20px; font-weight: 600; color: #f0f6fc; }
+  header h1 span { color: #58a6ff; }
+  .header-actions { display: flex; align-items: center; gap: 12px; }
+  .btn {
+    padding: 6px 14px; border-radius: 6px; border: 1px solid #30363d;
+    background: #21262d; color: #c9d1d9; cursor: pointer; font-size: 13px;
+    transition: background 0.15s;
+  }
+  .btn:hover { background: #30363d; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-danger { border-color: #f8514966; color: #f85149; }
+  .btn-danger:hover { background: #f851491a; }
+  .btn-green { border-color: #3fb95066; color: #3fb950; }
+  .btn-green:hover { background: #3fb9501a; }
+  .btn-green-solid { background: #238636; border-color: #2ea043; color: #fff; }
+  .btn-green-solid:hover { background: #2ea043; }
+  .btn-blue { border-color: #58a6ff66; color: #58a6ff; }
+  .btn-blue:hover { background: #58a6ff1a; }
+  .btn-purple { border-color: #bc8cff66; color: #bc8cff; }
+  .btn-purple:hover { background: #bc8cff1a; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  section { margin-bottom: 32px; }
+  section .section-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  section h2 { font-size: 16px; font-weight: 600; color: #f0f6fc; display: flex; align-items: center; gap: 8px; }
+  section h2 .count { background: #30363d; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #8b949e; }
+  .empty { color: #484f58; font-size: 14px; padding: 24px; text-align: center; border: 1px dashed #21262d; border-radius: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+  .card {
+    background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 16px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .card-header { display: flex; justify-content: space-between; align-items: flex-start; }
+  .card-title { font-size: 14px; font-weight: 600; color: #f0f6fc; }
+  .card-id { font-size: 12px; color: #484f58; font-family: monospace; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  .badge-running { background: #3fb9501a; color: #3fb950; }
+  .badge-stopped { background: #d299221a; color: #d29922; }
+  .badge-unknown { background: #f851491a; color: #f85149; }
+  .badge-creating { background: #58a6ff1a; color: #58a6ff; }
+  .card-details { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; }
+  .detail { font-size: 13px; }
+  .detail .label { color: #484f58; }
+  .detail .value { color: #c9d1d9; font-family: monospace; font-size: 12px; }
+  .card-actions { display: flex; gap: 6px; margin-top: 4px; flex-wrap: wrap; }
+  .card-actions .btn { font-size: 12px; padding: 4px 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 8px 12px; text-align: left; font-size: 13px; border-bottom: 1px solid #21262d; }
+  th { color: #484f58; font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { color: #c9d1d9; }
+  td.mono { font-family: monospace; font-size: 12px; }
+  .default-star { color: #d29922; }
+  .toast {
+    position: fixed; bottom: 24px; right: 24px; padding: 10px 16px;
+    background: #161b22; border: 1px solid #f85149; color: #f85149;
+    border-radius: 8px; font-size: 13px; z-index: 200; display: none;
+  }
+  .toast-success { border-color: #3fb950; color: #3fb950; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid #484f58;
+    border-top-color: #c9d1d9; border-radius: 50%; animation: spin 0.6s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .refresh-info { font-size: 12px; color: #484f58; }
+
+  /* Modal */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    z-index: 100; justify-content: center; align-items: center;
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    padding: 24px; width: 420px; max-width: 90vw;
+  }
+  .modal h3 { font-size: 16px; font-weight: 600; color: #f0f6fc; margin-bottom: 16px; }
+  .form-group { margin-bottom: 14px; }
+  .form-group label { display: block; font-size: 12px; color: #8b949e; margin-bottom: 4px; font-weight: 500; }
+  .form-group select, .form-group input {
+    width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #30363d;
+    background: #0d1117; color: #c9d1d9; font-size: 13px; font-family: inherit;
+  }
+  .form-group select:focus, .form-group input:focus { outline: none; border-color: #58a6ff; }
+  .form-group .hint { font-size: 11px; color: #484f58; margin-top: 2px; }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+
+  /* Terminal panel */
+  #terminal-panel {
+    display: none; position: fixed; bottom: 0; left: 0; right: 0;
+    background: #0d1117; border-top: 2px solid #30363d; z-index: 150;
+    flex-direction: column;
+  }
+  #terminal-panel.open { display: flex; }
+  #terminal-bar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 16px; background: #161b22; border-bottom: 1px solid #21262d;
+  }
+  #terminal-bar .term-title { font-size: 13px; color: #c9d1d9; font-weight: 500; }
+  #terminal-bar .term-title span { color: #bc8cff; font-family: monospace; font-size: 12px; }
+  #terminal-bar .term-status { font-size: 11px; padding: 2px 8px; border-radius: 8px; }
+  .term-connected { background: #3fb9501a; color: #3fb950; }
+  .term-disconnected { background: #f851491a; color: #f85149; }
+  #terminal-container { height: 350px; padding: 4px; }
+  #terminal-container .xterm { height: 100%; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>git</span>machine</h1>
+  <div class="header-actions">
+    <span class="refresh-info" id="last-refresh"></span>
+    <button class="btn btn-blue" onclick="refreshAll()">Refresh All</button>
+  </div>
+</header>
+<main>
+  <section>
+    <div class="section-header">
+      <h2>Nodes <span class="count" id="node-count">0</span></h2>
+      <button class="btn btn-green-solid" onclick="openCreateModal()">+ Create Node</button>
+    </div>
+    <div id="nodes-container"></div>
+  </section>
+  <section>
+    <h2>Credentials <span class="count" id="cred-count">0</span></h2>
+    <div id="creds-container"></div>
+  </section>
+</main>
+
+<!-- Create Node Modal -->
+<div class="modal-overlay" id="create-modal" onclick="if(event.target===this)closeCreateModal()">
+  <div class="modal">
+    <h3>Create Node</h3>
+    <div class="form-group">
+      <label>Provider</label>
+      <select id="create-provider">
+        <option value="aws">AWS (EC2)</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Name</label>
+      <input id="create-name" type="text" placeholder="my-node" />
+      <div class="hint">Optional display name / tag</div>
+    </div>
+    <div class="form-group">
+      <label>Instance Type</label>
+      <input id="create-type" type="text" placeholder="t3.medium" />
+      <div class="hint">Leave blank for default (t3.medium)</div>
+    </div>
+    <div class="form-group">
+      <label>Region</label>
+      <input id="create-region" type="text" placeholder="us-east-1" />
+      <div class="hint">Leave blank for default from credentials</div>
+    </div>
+    <div class="form-group">
+      <label>Account</label>
+      <select id="create-account">
+        <option value="">Default</option>
+      </select>
+      <div class="hint">Credential to use (from gitmachine auth)</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeCreateModal()">Cancel</button>
+      <button class="btn btn-green-solid" id="create-submit" onclick="createNode()">Create</button>
+    </div>
+  </div>
+</div>
+
+<!-- Terminal Panel -->
+<div id="terminal-panel">
+  <div id="terminal-bar">
+    <div class="term-title">SSH <span id="term-node-label"></span></div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <span id="term-status" class="term-status term-disconnected">disconnected</span>
+      <button class="btn" onclick="closeTerminal()" style="padding:2px 10px;font-size:12px">Close</button>
+    </div>
+  </div>
+  <div id="terminal-container"></div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script>
+let nodes = [];
+let credentials = [];
+let loading = {};
+let creating = false;
+
+// Terminal state
+let term = null;
+let fitAddon = null;
+let termWs = null;
+let termNodeId = null;
+
+async function api(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `HTTP ${res.status}`);
+  }
+  if (res.status === 204) return null;
+  return res.json();
+}
+
+function showToast(msg, success) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = success ? 'toast toast-success' : 'toast';
+  el.style.display = 'block';
+  setTimeout(() => el.style.display = 'none', 4000);
+}
+
+function badgeClass(status) {
+  if (status === 'running') return 'badge-running';
+  if (status === 'stopped') return 'badge-stopped';
+  if (status === 'creating') return 'badge-creating';
+  return 'badge-unknown';
+}
+
+function truncId(id) {
+  return id ? id.substring(0, 19) : '';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function renderNodes() {
+  const container = document.getElementById('nodes-container');
+  document.getElementById('node-count').textContent = nodes.length;
+  if (nodes.length === 0 && !creating) {
+    container.innerHTML = '<div class="empty">No nodes yet. Click <strong>+ Create Node</strong> to launch one.</div>';
+    return;
+  }
+  let html = '<div class="grid">';
+  if (creating) {
+    html += `<div class="card" style="opacity:0.7">
+      <div class="card-header">
+        <div>
+          <div class="card-title"><span class="spinner"></span> Creating node...</div>
+        </div>
+        <span class="badge badge-creating">creating</span>
+      </div>
+    </div>`;
+  }
+  html += nodes.map(n => {
+    const isLoading = loading[n.id];
+    const isSSH = termNodeId === n.id;
+    return `<div class="card" ${isSSH ? 'style="border-color:#bc8cff66"' : ''}>
+      <div class="card-header">
+        <div>
+          <div class="card-title">${esc(n.name || 'gitmachine')}</div>
+          <div class="card-id" title="${esc(n.id)}">${esc(truncId(n.id))}</div>
+        </div>
+        <span class="badge ${badgeClass(n.status)}">${esc(n.status)}</span>
+      </div>
+      <div class="card-details">
+        <div class="detail"><span class="label">Provider</span><br><span class="value">${esc(n.provider)}</span></div>
+        <div class="detail"><span class="label">Type</span><br><span class="value">${esc(n.instance_type)}</span></div>
+        <div class="detail"><span class="label">Region</span><br><span class="value">${esc(n.region)}</span></div>
+        <div class="detail"><span class="label">IP</span><br><span class="value">${n.public_ip ? esc(n.public_ip) : '—'}</span></div>
+        <div class="detail"><span class="label">Age</span><br><span class="value">${esc(n.age)}</span></div>
+        <div class="detail"><span class="label">Created</span><br><span class="value">${esc(n.created_at)}</span></div>
+      </div>
+      <div class="card-actions">
+        ${n.status === 'running' ? `<button class="btn btn-purple" onclick="openSSH('${esc(n.id)}','${esc(n.name || 'gitmachine')}')" ${isSSH ? 'disabled' : ''}>
+          ${isSSH ? 'SSH Active' : 'SSH'}</button>` : ''}
+        <button class="btn btn-blue" onclick="refreshNode('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'refresh' ? '<span class="spinner"></span>' : 'Refresh'}
+        </button>
+        ${n.status === 'running' ? `<button class="btn" onclick="stopNode('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'stop' ? '<span class="spinner"></span>' : 'Stop'}</button>` : ''}
+        ${n.status === 'stopped' ? `<button class="btn btn-green" onclick="startNode('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'start' ? '<span class="spinner"></span>' : 'Start'}</button>` : ''}
+        <button class="btn btn-danger" onclick="destroyNode('${esc(n.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'destroy' ? '<span class="spinner"></span>' : 'Destroy'}
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+function renderCreds() {
+  const container = document.getElementById('creds-container');
+  document.getElementById('cred-count').textContent = credentials.length;
+  if (credentials.length === 0) {
+    container.innerHTML = '<div class="empty">No credentials. Add one with <code>gitmachine auth add &lt;name&gt; &lt;provider&gt;</code></div>';
+    return;
+  }
+  container.innerHTML = `<table>
+    <thead><tr><th>Name</th><th>Provider</th><th>Region</th><th>Default</th></tr></thead>
+    <tbody>${credentials.map(c => `<tr>
+      <td class="mono">${esc(c.name)}</td>
+      <td>${esc(c.provider)}</td>
+      <td class="mono">${c.region ? esc(c.region) : '—'}</td>
+      <td>${c.default ? '<span class="default-star">★</span>' : ''}</td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+}
+
+async function fetchAll() {
+  try {
+    const [n, c] = await Promise.all([api('GET', '/api/nodes'), api('GET', '/api/credentials')]);
+    nodes = n || [];
+    credentials = c || [];
+    renderNodes();
+    renderCreds();
+    document.getElementById('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    showToast('Failed to fetch data: ' + e.message);
+  }
+}
+
+async function refreshAll() {
+  try {
+    nodes = await api('POST', '/api/nodes/refresh-all') || [];
+    renderNodes();
+    document.getElementById('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    showToast('Refresh failed: ' + e.message);
+  }
+}
+
+async function refreshNode(id) {
+  loading[id] = 'refresh'; renderNodes();
+  try {
+    await api('POST', `/api/nodes/${encodeURIComponent(id)}/refresh`);
+    await fetchAll();
+  } catch (e) { showToast('Refresh failed: ' + e.message); }
+  delete loading[id]; renderNodes();
+}
+
+async function stopNode(id) {
+  loading[id] = 'stop'; renderNodes();
+  try {
+    await api('POST', `/api/nodes/${encodeURIComponent(id)}/stop`);
+    await fetchAll();
+  } catch (e) { showToast('Stop failed: ' + e.message); }
+  delete loading[id]; renderNodes();
+}
+
+async function startNode(id) {
+  loading[id] = 'start'; renderNodes();
+  try {
+    await api('POST', `/api/nodes/${encodeURIComponent(id)}/start`);
+    await fetchAll();
+  } catch (e) { showToast('Start failed: ' + e.message); }
+  delete loading[id]; renderNodes();
+}
+
+async function destroyNode(id) {
+  if (!confirm('Destroy node ' + truncId(id) + '? This cannot be undone.')) return;
+  loading[id] = 'destroy'; renderNodes();
+  try {
+    await api('DELETE', `/api/nodes/${encodeURIComponent(id)}`);
+    if (termNodeId === id) closeTerminal();
+    await fetchAll();
+    showToast('Node destroyed', true);
+  } catch (e) { showToast('Destroy failed: ' + e.message); }
+  delete loading[id]; renderNodes();
+}
+
+// --- Create Node ---
+
+function openCreateModal() {
+  const sel = document.getElementById('create-account');
+  sel.innerHTML = '<option value="">Default</option>';
+  credentials.filter(c => c.provider === 'aws').forEach(c => {
+    sel.innerHTML += `<option value="${esc(c.name)}">${esc(c.name)}${c.default ? ' (default)' : ''}</option>`;
+  });
+  document.getElementById('create-name').value = '';
+  document.getElementById('create-type').value = '';
+  document.getElementById('create-region').value = '';
+  document.getElementById('create-modal').classList.add('open');
+}
+
+function closeCreateModal() {
+  document.getElementById('create-modal').classList.remove('open');
+}
+
+async function createNode() {
+  const btn = document.getElementById('create-submit');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Creating...';
+  creating = true;
+  closeCreateModal();
+  renderNodes();
+
+  const body = {
+    provider: document.getElementById('create-provider').value,
+    name: document.getElementById('create-name').value.trim(),
+    instance_type: document.getElementById('create-type').value.trim(),
+    region: document.getElementById('create-region').value.trim(),
+    account: document.getElementById('create-account').value,
+  };
+
+  try {
+    await api('POST', '/api/nodes', body);
+    showToast('Node created successfully', true);
+    await fetchAll();
+  } catch (e) {
+    showToast('Create failed: ' + e.message);
+  }
+
+  creating = false;
+  btn.disabled = false;
+  btn.textContent = 'Create';
+  renderNodes();
+}
+
+// --- SSH Terminal ---
+
+function openSSH(id, name) {
+  // Close existing session if different node.
+  if (termWs) {
+    termWs.close();
+    termWs = null;
+  }
+  if (term) {
+    term.dispose();
+    term = null;
+  }
+
+  termNodeId = id;
+  document.getElementById('term-node-label').textContent = name + ' (' + truncId(id) + ')';
+
+  const panel = document.getElementById('terminal-panel');
+  panel.classList.add('open');
+
+  // Add padding to main so content isn't hidden behind terminal.
+  document.querySelector('main').style.paddingBottom = '380px';
+
+  const statusEl = document.getElementById('term-status');
+  statusEl.textContent = 'connecting...';
+  statusEl.className = 'term-status term-disconnected';
+
+  // Create terminal.
+  term = new window.Terminal({
+    cursorBlink: true,
+    fontSize: 13,
+    fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
+    theme: {
+      background: '#0d1117',
+      foreground: '#c9d1d9',
+      cursor: '#58a6ff',
+      selectionBackground: '#264f78',
+      black: '#484f58',
+      red: '#ff7b72',
+      green: '#3fb950',
+      yellow: '#d29922',
+      blue: '#58a6ff',
+      magenta: '#bc8cff',
+      cyan: '#39c5cf',
+      white: '#b1bac4',
+      brightBlack: '#6e7681',
+      brightRed: '#ffa198',
+      brightGreen: '#56d364',
+      brightYellow: '#e3b341',
+      brightBlue: '#79c0ff',
+      brightMagenta: '#d2a8ff',
+      brightCyan: '#56d4dd',
+      brightWhite: '#f0f6fc',
+    }
+  });
+
+  fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+
+  const container = document.getElementById('terminal-container');
+  container.innerHTML = '';
+  term.open(container);
+  fitAddon.fit();
+
+  // Connect WebSocket.
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${location.host}/api/nodes/${encodeURIComponent(id)}/ssh`;
+  termWs = new WebSocket(wsUrl);
+
+  termWs.onopen = () => {
+    statusEl.textContent = 'connected';
+    statusEl.className = 'term-status term-connected';
+    term.focus();
+  };
+
+  termWs.onmessage = (e) => {
+    term.write(e.data);
+  };
+
+  termWs.onclose = () => {
+    statusEl.textContent = 'disconnected';
+    statusEl.className = 'term-status term-disconnected';
+    term.write('\r\n\x1b[90m--- session closed ---\x1b[0m\r\n');
+  };
+
+  termWs.onerror = () => {
+    statusEl.textContent = 'error';
+    statusEl.className = 'term-status term-disconnected';
+    showToast('SSH connection failed');
+  };
+
+  // Send keystrokes to WebSocket.
+  term.onData((data) => {
+    if (termWs && termWs.readyState === WebSocket.OPEN) {
+      termWs.send(data);
+    }
+  });
+
+  renderNodes();
+}
+
+function closeTerminal() {
+  if (termWs) {
+    termWs.close();
+    termWs = null;
+  }
+  if (term) {
+    term.dispose();
+    term = null;
+  }
+  termNodeId = null;
+  document.getElementById('terminal-panel').classList.remove('open');
+  document.querySelector('main').style.paddingBottom = '';
+  renderNodes();
+}
+
+// Handle window resize for terminal.
+window.addEventListener('resize', () => {
+  if (fitAddon && term) {
+    fitAddon.fit();
+  }
+});
+
+fetchAll();
+setInterval(fetchAll, 5000);
+</script>
+</body>
+</html>

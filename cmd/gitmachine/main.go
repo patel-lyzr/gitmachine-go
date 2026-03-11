@@ -37,6 +37,8 @@ func main() {
 			os.Exit(1)
 		}
 		handleAuth(args)
+	case "ui":
+		handleUI(args)
 	case "version":
 		fmt.Println("gitmachine v0.1.0")
 	case "help", "--help", "-h":
@@ -730,6 +732,7 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  auth       Manage cloud credentials")
 	fmt.Println("  node       Manage cloud compute nodes")
+	fmt.Println("  ui         Open web dashboard")
 	fmt.Println("  version    Show version")
 	fmt.Println("  help       Show this help")
 }
