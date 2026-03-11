@@ -144,3 +144,42 @@ type E2BMachineConfig struct {
 	// Metadata attaches key-value metadata to the sandbox.
 	Metadata map[string]string
 }
+
+// EC2MachineConfig holds configuration for constructing an EC2Machine.
+type EC2MachineConfig struct {
+	// AccessKeyID is the AWS access key. Falls back to AWS_ACCESS_KEY_ID env var.
+	AccessKeyID string
+
+	// SecretAccessKey is the AWS secret key. Falls back to AWS_SECRET_ACCESS_KEY env var.
+	SecretAccessKey string
+
+	// Region is the AWS region (e.g. "us-east-1"). Falls back to AWS_REGION env var. Defaults to "us-east-1".
+	Region string
+
+	// AMI is the Amazon Machine Image ID. Defaults to latest Ubuntu 22.04 LTS.
+	AMI string
+
+	// InstanceType is the EC2 instance type. Defaults to "t3.medium".
+	InstanceType string
+
+	// KeyName is the name of an existing EC2 key pair for SSH access.
+	// If empty, a temporary key pair is created and cleaned up on Stop.
+	KeyName string
+
+	// PrivateKeyPEM is the PEM-encoded private key for SSH.
+	// Required if KeyName is provided. Auto-generated if KeyName is empty.
+	PrivateKeyPEM string
+
+	// SecurityGroupIDs specifies security groups. Must allow inbound SSH (port 22).
+	// If empty, a temporary security group is created and cleaned up on Stop.
+	SecurityGroupIDs []string
+
+	// SubnetID optionally places the instance in a specific subnet.
+	SubnetID string
+
+	// SSHUser is the SSH username. Defaults to "ubuntu".
+	SSHUser string
+
+	// Tags are applied to all created AWS resources.
+	Tags map[string]string
+}
