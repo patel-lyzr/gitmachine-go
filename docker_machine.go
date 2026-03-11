@@ -16,14 +16,16 @@ type DockerMachine struct {
 	mu    sync.Mutex
 	state MachineState
 
-	containerID string
-	name        string
-	image       string
-	cpus        string
-	memory      string
-	diskSize    string
-	nodeID      string
-	node        *CloudMachine
+	containerID  string
+	name         string
+	image        string
+	cpus         string
+	memory       string
+	diskSize     string
+	ports        []int
+	portMappings []PortMapping
+	nodeID       string
+	node         *CloudMachine
 
 	dockerReady bool
 	useSudo     bool // prefix docker commands with sudo when user lacks group access
@@ -48,6 +50,7 @@ func NewDockerMachine(node *CloudMachine, config DockerMachineConfig) *DockerMac
 		cpus:     config.CPUs,
 		memory:   config.Memory,
 		diskSize: config.DiskSize,
+		ports:    config.Ports,
 		nodeID:   node.ID(),
 		node:     node,
 	}
@@ -130,8 +133,35 @@ func (m *DockerMachine) Start(ctx context.Context) error {
 		return fmt.Errorf("pull image %s: %s", m.image, pullResult.Stderr)
 	}
 
+	// Auto-assign host ports for container ports.
+	// If no ports were explicitly requested, expose a set of common defaults.
+	ports := m.ports
+	if len(ports) == 0 {
+		ports = defaultSandboxPorts
+	}
+
+	usedPorts, _ := m.getUsedHostPorts(ctx)
+	nextPort := 10000
+	var mappings []PortMapping
+	for _, cp := range ports {
+		for usedPorts[nextPort] {
+			nextPort++
+		}
+		hp := nextPort
+		usedPorts[hp] = true
+		nextPort++
+		mappings = append(mappings, PortMapping{
+			ContainerPort: cp,
+			HostPort:      hp,
+			URL:           fmt.Sprintf("http://%s:%d", m.node.GetPublicIP(), hp),
+		})
+	}
+
 	// Run container in detached mode with sleep infinity to keep it alive.
 	runArgs := fmt.Sprintf("docker run -d --name %s --hostname %s", m.name, m.name)
+	for _, pm := range mappings {
+		runArgs += fmt.Sprintf(" -p %d:%d", pm.HostPort, pm.ContainerPort)
+	}
 	if m.cpus != "" {
 		runArgs += fmt.Sprintf(" --cpus %s", m.cpus)
 	}
@@ -155,6 +185,7 @@ func (m *DockerMachine) Start(ctx context.Context) error {
 
 	m.mu.Lock()
 	m.containerID = containerID
+	m.portMappings = mappings
 	m.state = StateRunning
 	m.mu.Unlock()
 
@@ -318,7 +349,45 @@ func (m *DockerMachine) GetName() string {
 	return m.name
 }
 
+// PortMappings returns the resolved port mappings after Start().
+func (m *DockerMachine) PortMappings() []PortMapping {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.portMappings
+}
+
+// defaultSandboxPorts are the container ports auto-exposed when the user
+// doesn't specify any --port flags. Covers the most common dev server ports.
+var defaultSandboxPorts = []int{22, 80, 443, 3000, 5000, 8000, 8080, 8888}
+
 // --- internal helpers ---
+
+// getUsedHostPorts queries the node for ports already bound by docker containers.
+func (m *DockerMachine) getUsedHostPorts(ctx context.Context) (map[int]bool, error) {
+	used := make(map[int]bool)
+	cmd := m.dockerCmd("docker ps --format '{{.Ports}}'")
+	result, err := m.node.Execute(ctx, cmd, nil)
+	if err != nil || result.ExitCode != 0 {
+		return used, nil // best-effort
+	}
+	// Parse lines like "0.0.0.0:10000->8080/tcp, :::10000->8080/tcp"
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		for _, part := range strings.Split(line, ",") {
+			part = strings.TrimSpace(part)
+			if idx := strings.Index(part, "->"); idx > 0 {
+				hostPart := part[:idx]
+				if ci := strings.LastIndex(hostPart, ":"); ci >= 0 {
+					portStr := hostPart[ci+1:]
+					var p int
+					if _, err := fmt.Sscanf(portStr, "%d", &p); err == nil {
+						used[p] = true
+					}
+				}
+			}
+		}
+	}
+	return used, nil
+}
 
 func (m *DockerMachine) ensureDocker(ctx context.Context) error {
 	if m.dockerReady {
@@ -355,6 +424,31 @@ func (m *DockerMachine) ensureDocker(ctx context.Context) error {
 	// Use sudo for this session.
 	m.useSudo = true
 	m.dockerReady = true
+
+	// Deploy the agent after Docker is set up.
+	_ = m.ensureAgent(ctx)
+
+	return nil
+}
+
+// ensureAgent checks if gitmachine-agent is running on the node, and deploys it if not.
+func (m *DockerMachine) ensureAgent(ctx context.Context) error {
+	// Check if agent is already running.
+	result, err := m.node.Execute(ctx, "curl -sf --connect-timeout 2 http://localhost:9420/health", nil)
+	if err == nil && result.ExitCode == 0 {
+		return nil // already running
+	}
+
+	// Check if the binary exists.
+	result, err = m.node.Execute(ctx, "test -f /usr/local/bin/gitmachine-agent && echo ok", nil)
+	if err == nil && result.ExitCode == 0 && strings.Contains(result.Stdout, "ok") {
+		// Binary exists but not running — start it.
+		_, _ = m.node.Execute(ctx, "sudo nohup /usr/local/bin/gitmachine-agent > /var/log/gitmachine-agent.log 2>&1 &", nil)
+		return nil
+	}
+
+	// Binary doesn't exist — we need to upload it.
+	// For now, build and upload via SSH. In production this would be a pre-baked AMI or S3 download.
 	return nil
 }
 

@@ -319,7 +319,18 @@ func (p *EC2Provider) createSecurityGroup(ctx context.Context) error {
 	if err == nil && len(desc.SecurityGroups) > 0 {
 		sgID := *desc.SecurityGroups[0].GroupId
 		p.sgIDs = []string{sgID}
-		// Not marked as createdSGID — shared SG is never auto-deleted.
+
+		// Ensure agent port (9420) is open — may be missing on older SGs.
+		_, _ = p.ec2Client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
+			GroupId: aws.String(sgID),
+			IpPermissions: []ec2types.IpPermission{{
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(9420),
+				ToPort:     aws.Int32(9420),
+				IpRanges:   []ec2types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+			}},
+		}) // Ignore duplicate rule error.
+
 		return nil
 	}
 
@@ -343,15 +354,31 @@ func (p *EC2Provider) createSecurityGroup(ctx context.Context) error {
 
 	_, err = p.ec2Client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(sgID),
-		IpPermissions: []ec2types.IpPermission{{
-			IpProtocol: aws.String("tcp"),
-			FromPort:   aws.Int32(22),
-			ToPort:     aws.Int32(22),
-			IpRanges:   []ec2types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
-		}},
+		IpPermissions: []ec2types.IpPermission{
+			{
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(22),
+				ToPort:     aws.Int32(22),
+				IpRanges:   []ec2types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+			},
+			{
+				// Agent API port.
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(9420),
+				ToPort:     aws.Int32(9420),
+				IpRanges:   []ec2types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+			},
+			{
+				// Sandbox port range for container port mappings.
+				IpProtocol: aws.String("tcp"),
+				FromPort:   aws.Int32(10000),
+				ToPort:     aws.Int32(65535),
+				IpRanges:   []ec2types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}},
+			},
+		},
 	})
 	if err != nil {
-		return fmt.Errorf("authorize ssh ingress: %w", err)
+		return fmt.Errorf("authorize ingress: %w", err)
 	}
 
 	p.sgIDs = []string{sgID}

@@ -29,23 +29,25 @@ type nodeResponse struct {
 	Region       string `json:"region"`
 	PublicIP     string `json:"public_ip"`
 	Status       string `json:"status"`
+	AgentStatus  string `json:"agent_status"`
 	Age          string `json:"age"`
 	CreatedAt    string `json:"created_at"`
 }
 
 type sandboxResponse struct {
-	ID        string `json:"id"`
-	ShortID   string `json:"short_id"`
-	Name      string `json:"name"`
-	NodeID    string `json:"node_id"`
-	NodeShort string `json:"node_short"`
-	Image     string `json:"image"`
-	CPUs      string `json:"cpus,omitempty"`
-	Memory    string `json:"memory,omitempty"`
-	DiskSize  string `json:"disk_size,omitempty"`
-	Status    string `json:"status"`
-	Age       string `json:"age"`
-	CreatedAt string `json:"created_at"`
+	ID        string           `json:"id"`
+	ShortID   string           `json:"short_id"`
+	Name      string           `json:"name"`
+	NodeID    string           `json:"node_id"`
+	NodeShort string           `json:"node_short"`
+	Image     string           `json:"image"`
+	CPUs      string           `json:"cpus,omitempty"`
+	Memory    string           `json:"memory,omitempty"`
+	DiskSize  string           `json:"disk_size,omitempty"`
+	Ports     []gm.PortMapping `json:"ports,omitempty"`
+	Status    string           `json:"status"`
+	Age       string           `json:"age"`
+	CreatedAt string           `json:"created_at"`
 }
 
 type credentialResponse struct {
@@ -84,6 +86,8 @@ func handleUI(args []string) {
 	mux.HandleFunc("GET /api/sandboxes", apiListSandboxes)
 	mux.HandleFunc("POST /api/sandboxes", apiCreateSandbox)
 	mux.HandleFunc("DELETE /api/sandboxes/{id}", apiDestroySandbox)
+	mux.HandleFunc("GET /api/sandboxes/{id}", apiGetSandbox)
+	mux.HandleFunc("POST /api/sandboxes/{id}/exec", apiExecSandbox)
 	mux.HandleFunc("POST /api/sandboxes/{id}/stop", apiStopSandbox)
 	mux.HandleFunc("GET /api/sandboxes/{id}/ssh", apiSandboxSSHWebSocket)
 
@@ -220,6 +224,15 @@ func apiStartNode(w http.ResponseWriter, r *http.Request) {
 		n.Status = "running"
 		n.PublicIP = inst.PublicIP
 	})
+
+	// Auto-deploy/restart agent in background.
+	nodeCopy := *node
+	nodeCopy.PublicIP = inst.PublicIP
+	go func() {
+		invalidateAgentCache(nodeCopy.ID)
+		_ = deployAgentToNode(&nodeCopy)
+	}()
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -339,6 +352,11 @@ func apiCreateAWS(w http.ResponseWriter, r *http.Request, req createNodeRequest)
 	}
 	_ = state.Add(record)
 
+	// Auto-deploy agent in background (don't block the response).
+	go func() {
+		_ = deployAgentToNode(&record)
+	}()
+
 	writeJSON(w, toNodeResponses([]gm.NodeRecord{record}))
 }
 
@@ -372,6 +390,68 @@ func apiListSandboxes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, toSandboxResponses(sstate.Sandboxes))
 }
 
+func apiGetSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, rec := resolveSandboxAPI(w, id)
+	if rec == nil {
+		return
+	}
+	resp := toSandboxResponses([]gm.SandboxRecord{*rec})
+	writeJSON(w, resp[0])
+}
+
+type execSandboxRequest struct {
+	Cmd     string            `json:"cmd"`
+	Cwd     string            `json:"cwd,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+	Timeout int               `json:"timeout,omitempty"`
+}
+
+type execSandboxResponse struct {
+	ExitCode int    `json:"exit_code"`
+	Stdout   string `json:"stdout"`
+	Stderr   string `json:"stderr"`
+}
+
+func apiExecSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	_, rec := resolveSandboxAPI(w, id)
+	if rec == nil {
+		return
+	}
+
+	var req execSandboxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Cmd == "" {
+		httpError(w, http.StatusBadRequest, "cmd is required")
+		return
+	}
+
+	node := resolveNodeForSandboxAPI(w, rec.NodeID)
+	if node == nil {
+		return
+	}
+
+	if !isAgentAvailable(node) {
+		httpError(w, http.StatusServiceUnavailable, "agent not available on node "+node.ID)
+		return
+	}
+
+	result, err := agentExecInSandbox(node, rec.ID, req)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "agent exec: "+err.Error())
+		return
+	}
+	writeJSON(w, execSandboxResponse{
+		ExitCode: result.ExitCode,
+		Stdout:   result.Stdout,
+		Stderr:   result.Stderr,
+	})
+}
+
 type createSandboxRequest struct {
 	NodeID   string `json:"node_id"`
 	Image    string `json:"image"`
@@ -379,6 +459,7 @@ type createSandboxRequest struct {
 	CPUs     string `json:"cpus"`
 	Memory   string `json:"memory"`
 	DiskSize string `json:"disk_size"`
+	Ports    []int  `json:"ports"`
 }
 
 func apiCreateSandbox(w http.ResponseWriter, r *http.Request) {
@@ -387,46 +468,41 @@ func apiCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.NodeID == "" {
-		httpError(w, http.StatusBadRequest, "node_id is required")
-		return
-	}
 
-	// Resolve node.
+	// Resolve node — auto-select if node_id is empty.
 	nstate, err := gm.NewNodeState()
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	node := nstate.Find(req.NodeID)
-	if node == nil {
-		node = findByPrefix(nstate, req.NodeID)
+
+	var node *gm.NodeRecord
+	if req.NodeID != "" {
+		node = nstate.Find(req.NodeID)
+		if node == nil {
+			node = findByPrefix(nstate, req.NodeID)
+		}
+		if node == nil {
+			httpError(w, http.StatusNotFound, "node not found: "+req.NodeID)
+			return
+		}
+	} else {
+		// Auto-select: pick the running node with the fewest sandboxes.
+		node = apiAutoSelectNode(nstate)
+		if node == nil {
+			httpError(w, http.StatusBadRequest, "no running nodes available")
+			return
+		}
 	}
-	if node == nil {
-		httpError(w, http.StatusNotFound, "node not found: "+req.NodeID)
+
+	if !isAgentAvailable(node) {
+		httpError(w, http.StatusServiceUnavailable, "agent not available on node "+node.ID)
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
-	defer cancel()
-
-	cloudMachine, err := connectToNodeAPI(ctx, node)
+	info, err := agentCreateSandbox(node, req)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "connect to node: "+err.Error())
-		return
-	}
-
-	config := gm.DockerMachineConfig{
-		Image:    req.Image,
-		Name:     req.Name,
-		CPUs:     req.CPUs,
-		Memory:   req.Memory,
-		DiskSize: req.DiskSize,
-	}
-	dm := gm.NewDockerMachine(cloudMachine, config)
-
-	if err := dm.Start(ctx); err != nil {
-		httpError(w, http.StatusInternalServerError, "create sandbox: "+err.Error())
+		httpError(w, http.StatusInternalServerError, "agent create: "+err.Error())
 		return
 	}
 
@@ -441,14 +517,24 @@ func apiCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var ports []gm.PortMapping
+	for _, p := range info.Ports {
+		ports = append(ports, gm.PortMapping{
+			ContainerPort: p.ContainerPort,
+			HostPort:      p.HostPort,
+			URL:           p.URL,
+		})
+	}
+
 	rec := gm.SandboxRecord{
-		ID:        dm.ID(),
-		Name:      dm.GetName(),
+		ID:        info.ID,
+		Name:      info.Name,
 		NodeID:    node.ID,
 		Image:     finalImage,
 		CPUs:      req.CPUs,
 		Memory:    req.Memory,
 		DiskSize:  req.DiskSize,
+		Ports:     ports,
 		Status:    "running",
 		CreatedAt: time.Now(),
 	}
@@ -469,23 +555,13 @@ func apiStopSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-
-	cloudMachine, err := connectToNodeAPI(ctx, node)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "connect to node: "+err.Error())
+	if !isAgentAvailable(node) {
+		httpError(w, http.StatusServiceUnavailable, "agent not available on node "+node.ID)
 		return
 	}
 
-	stopCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker stop %s", rec.ID))
-	result, err := cloudMachine.Execute(ctx, stopCmd, nil)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if result.ExitCode != 0 {
-		httpError(w, http.StatusInternalServerError, result.Stderr)
+	if err := agentStopSandbox(node, rec.ID); err != nil {
+		httpError(w, http.StatusInternalServerError, "agent stop: "+err.Error())
 		return
 	}
 
@@ -508,13 +584,8 @@ func apiDestroySandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-	defer cancel()
-
-	cloudMachine, err := connectToNodeAPI(ctx, node)
-	if err == nil {
-		rmCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker rm -f %s", rec.ID))
-		_, _ = cloudMachine.Execute(ctx, rmCmd, nil)
+	if isAgentAvailable(node) {
+		_ = agentRemoveSandbox(node, rec.ID)
 	}
 
 	_ = sstate.Remove(rec.ID)
@@ -690,6 +761,37 @@ func resolveSandboxAPI(w http.ResponseWriter, idOrPrefix string) (*gm.SandboxSta
 	return sstate, rec
 }
 
+// apiAutoSelectNode picks the running node with the fewest sandboxes.
+func apiAutoSelectNode(nstate *gm.NodeState) *gm.NodeRecord {
+	var running []int
+	for i := range nstate.Nodes {
+		if nstate.Nodes[i].Status == "running" && nstate.Nodes[i].PublicIP != "" {
+			running = append(running, i)
+		}
+	}
+	if len(running) == 0 {
+		return nil
+	}
+
+	sstate, _ := gm.NewSandboxState()
+	sandboxCount := make(map[string]int)
+	if sstate != nil {
+		for _, s := range sstate.Sandboxes {
+			if s.Status == "running" {
+				sandboxCount[s.NodeID]++
+			}
+		}
+	}
+
+	best := running[0]
+	for _, idx := range running[1:] {
+		if sandboxCount[nstate.Nodes[idx].ID] < sandboxCount[nstate.Nodes[best].ID] {
+			best = idx
+		}
+	}
+	return &nstate.Nodes[best]
+}
+
 func resolveNodeForSandboxAPI(w http.ResponseWriter, nodeID string) *gm.NodeRecord {
 	nstate, err := gm.NewNodeState()
 	if err != nil {
@@ -702,11 +804,6 @@ func resolveNodeForSandboxAPI(w http.ResponseWriter, nodeID string) *gm.NodeReco
 		return nil
 	}
 	return node
-}
-
-func connectToNodeAPI(ctx context.Context, node *gm.NodeRecord) (*gm.CloudMachine, error) {
-	provider := providerForNode(node)
-	return gm.ConnectCloudMachine(ctx, provider, node.ID)
 }
 
 func toSandboxResponses(sandboxes []gm.SandboxRecord) []sandboxResponse {
@@ -730,6 +827,7 @@ func toSandboxResponses(sandboxes []gm.SandboxRecord) []sandboxResponse {
 			CPUs:      s.CPUs,
 			Memory:    s.Memory,
 			DiskSize:  s.DiskSize,
+			Ports:     s.Ports,
 			Status:    s.Status,
 			Age:       formatAge(time.Since(s.CreatedAt)),
 			CreatedAt: s.CreatedAt.Format(time.RFC3339),
@@ -810,6 +908,18 @@ func toNodeResponses(nodes []gm.NodeRecord) []nodeResponse {
 		if name == "" {
 			name = "gitmachine"
 		}
+
+		agentStatus := "unknown"
+		if n.Status == "running" && n.PublicIP != "" {
+			if isAgentAvailable(&n) {
+				agentStatus = "running"
+			} else {
+				agentStatus = "unreachable"
+			}
+		} else if n.Status == "stopped" {
+			agentStatus = "stopped"
+		}
+
 		out[i] = nodeResponse{
 			ID:           n.ID,
 			Name:         name,
@@ -818,6 +928,7 @@ func toNodeResponses(nodes []gm.NodeRecord) []nodeResponse {
 			Region:       n.Region,
 			PublicIP:     n.PublicIP,
 			Status:       n.Status,
+			AgentStatus:  agentStatus,
 			Age:          formatAge(time.Since(n.CreatedAt)),
 			CreatedAt:    n.CreatedAt.Format(time.RFC3339),
 		}

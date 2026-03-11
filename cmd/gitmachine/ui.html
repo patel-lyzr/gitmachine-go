@@ -219,6 +219,11 @@
       </div>
       <div class="hint">Optional resource limits (leave blank for no limits)</div>
     </div>
+    <div class="form-group">
+      <label>Ports</label>
+      <input id="sandbox-ports" type="text" placeholder="e.g. 3000, 8080" />
+      <div class="hint">Comma-separated container ports to expose (each gets a unique URL)</div>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeCreateSandboxModal()">Cancel</button>
       <button class="btn btn-green-solid" id="sandbox-submit" onclick="createSandbox()">Create</button>
@@ -326,6 +331,7 @@ function renderNodes() {
         <div class="detail"><span class="label">Type</span><br><span class="value">${esc(n.instance_type)}</span></div>
         <div class="detail"><span class="label">Region</span><br><span class="value">${esc(n.region)}</span></div>
         <div class="detail"><span class="label">IP</span><br><span class="value">${n.public_ip ? esc(n.public_ip) : '—'}</span></div>
+        <div class="detail"><span class="label">Agent</span><br><span class="value"><span class="badge ${n.agent_status === 'running' ? 'badge-running' : n.agent_status === 'unreachable' ? 'badge-unknown' : 'badge-stopped'}" style="font-size:0.7rem;padding:2px 6px">${esc(n.agent_status)}</span></span></div>
         <div class="detail"><span class="label">Age</span><br><span class="value">${esc(n.age)}</span></div>
         <div class="detail"><span class="label">Created</span><br><span class="value">${esc(n.created_at)}</span></div>
       </div>
@@ -654,6 +660,9 @@ function renderSandboxes() {
         ${s.cpus || s.memory || s.disk_size ? `<div class="detail"><span class="label">Resources</span><br><span class="value">${[s.cpus ? s.cpus + ' CPU' : '', s.memory ? s.memory + ' RAM' : '', s.disk_size ? s.disk_size + ' disk' : ''].filter(Boolean).join(', ')}</span></div>` : ''}
         <div class="detail"><span class="label">Age</span><br><span class="value">${esc(s.age)}</span></div>
       </div>
+      ${s.ports && s.ports.length ? `<div class="card-details" style="border-top:1px solid #333;padding-top:8px;margin-top:4px">
+        ${s.ports.map(p => `<div class="detail"><span class="label">Port ${p.container_port}</span><br><a href="${esc(p.url)}" target="_blank" rel="noopener" style="color:#7c8aff;font-size:12px;word-break:break-all">${esc(p.url)}</a></div>`).join('')}
+      </div>` : ''}
       <div class="card-actions">
         ${s.status === 'running' ? `<button class="btn btn-purple" onclick="openSandboxSSH('${esc(s.id)}','${esc(s.name)}')" ${isSSH ? 'disabled' : ''}>
           ${isSSH ? 'SSH Active' : 'SSH'}</button>` : ''}
@@ -682,6 +691,7 @@ function openCreateSandboxModal() {
   document.getElementById('sandbox-cpus').value = '';
   document.getElementById('sandbox-memory').value = '';
   document.getElementById('sandbox-disk').value = '';
+  document.getElementById('sandbox-ports').value = '';
   document.getElementById('create-sandbox-modal').classList.add('open');
 }
 
@@ -697,6 +707,8 @@ async function createSandbox() {
   closeCreateSandboxModal();
   renderSandboxes();
 
+  const portsStr = document.getElementById('sandbox-ports').value.trim();
+  const ports = portsStr ? portsStr.split(',').map(p => parseInt(p.trim())).filter(p => !isNaN(p)) : [];
   const body = {
     node_id: document.getElementById('sandbox-node').value,
     image: document.getElementById('sandbox-image').value.trim(),
@@ -704,6 +716,7 @@ async function createSandbox() {
     cpus: document.getElementById('sandbox-cpus').value.trim(),
     memory: document.getElementById('sandbox-memory').value.trim(),
     disk_size: document.getElementById('sandbox-disk').value.trim(),
+    ports: ports,
   };
 
   try {

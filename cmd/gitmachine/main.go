@@ -256,6 +256,8 @@ func handleNode(args []string) {
 		nodeDestroy(rest)
 	case "ssh":
 		nodeSSH(rest)
+	case "deploy-agent":
+		nodeDeployAgent(rest)
 	case "help", "--help", "-h":
 		printNodeUsage()
 	default:
@@ -465,6 +467,19 @@ func createAWS(ctx context.Context, instanceType, region, ami, sshUser, name, ac
 	fmt.Printf("  Type:     %s\n", instanceType)
 	fmt.Printf("  Region:   %s\n", region)
 	fmt.Printf("  Provider: aws\n")
+
+	// Auto-deploy agent to the new node.
+	node := state.Find(machine.ID())
+	if node != nil {
+		fmt.Print("\nDeploying agent...")
+		if err := deployAgentToNode(node); err != nil {
+			fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+			fmt.Println("  You can retry with: gitmachine node deploy-agent", machine.ID())
+		} else {
+			fmt.Println(" done!")
+			fmt.Printf("  Agent: http://%s:9420\n", node.PublicIP)
+		}
+	}
 }
 
 func nodeList() {
@@ -584,6 +599,15 @@ func nodeStart(args []string) {
 	})
 	fmt.Println(" done!")
 	fmt.Printf("  IP: %s\n", inst.PublicIP)
+
+	// Auto-deploy/restart agent.
+	node.PublicIP = inst.PublicIP
+	fmt.Print("Starting agent...")
+	if err := deployAgentToNode(node); err != nil {
+		fmt.Fprintf(os.Stderr, " failed: %v\n", err)
+	} else {
+		fmt.Println(" done!")
+	}
 }
 
 func nodeDestroy(args []string) {
@@ -651,6 +675,130 @@ func nodeSSH(args []string) {
 	if err := cmd.Run(); err != nil {
 		os.Exit(1)
 	}
+}
+
+// deployAgentToNode builds, uploads, and starts the agent on a node.
+// It's called automatically after node create and node start.
+func deployAgentToNode(node *gm.NodeRecord) error {
+	if node.PublicIP == "" {
+		return fmt.Errorf("node has no public IP")
+	}
+
+	sshUser := node.SSHUser
+	if sshUser == "" {
+		sshUser = "ubuntu"
+	}
+
+	// Check if agent is already running.
+	checkArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=5"}
+	if node.SSHKeyPath != "" {
+		checkArgs = append(checkArgs, "-i", node.SSHKeyPath)
+	}
+	checkArgs = append(checkArgs, fmt.Sprintf("%s@%s", sshUser, node.PublicIP), "curl -sf --connect-timeout 2 http://localhost:9420/health")
+	checkCmd := execCommand("ssh", checkArgs...)
+	if out, err := checkCmd.CombinedOutput(); err == nil && strings.Contains(string(out), "ok") {
+		return nil // already running
+	}
+
+	// Check if binary exists on node, just start it.
+	startArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=5"}
+	if node.SSHKeyPath != "" {
+		startArgs = append(startArgs, "-i", node.SSHKeyPath)
+	}
+	startScript := "test -f /usr/local/bin/gitmachine-agent && " +
+		"{ sudo systemctl start gitmachine-agent 2>/dev/null || sudo nohup /usr/local/bin/gitmachine-agent > /var/log/gitmachine-agent.log 2>&1 &; sleep 1; echo started; } || echo missing"
+	startArgs = append(startArgs, fmt.Sprintf("%s@%s", sshUser, node.PublicIP), startScript)
+	startCmd := execCommand("ssh", startArgs...)
+	if out, err := startCmd.CombinedOutput(); err == nil && strings.Contains(string(out), "started") {
+		return nil
+	}
+
+	// Need to build and upload.
+	agentBinary := "/tmp/gitmachine-agent-linux"
+	buildCmd := execCommand("go", "build", "-o", agentBinary, "./cmd/gitmachine-agent")
+	buildCmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64", "CGO_ENABLED=0")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("build: %s (%w)", string(out), err)
+	}
+
+	// SCP upload.
+	scpArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	if node.SSHKeyPath != "" {
+		scpArgs = append(scpArgs, "-i", node.SSHKeyPath)
+	}
+	scpArgs = append(scpArgs, agentBinary, fmt.Sprintf("%s@%s:/tmp/gitmachine-agent", sshUser, node.PublicIP))
+	scpCmd := execCommand("scp", scpArgs...)
+	if out, err := scpCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("scp: %s (%w)", string(out), err)
+	}
+
+	// Install Docker (if needed) + agent as a systemd service.
+	installScript := `#!/bin/bash
+set -e
+
+# Install Docker if not present.
+if ! command -v docker &>/dev/null; then
+  echo "Installing Docker..."
+  curl -fsSL https://get.docker.com | sudo sh
+  sudo usermod -aG docker $USER
+  echo "Docker installed."
+fi
+
+# Install agent binary.
+sudo mv /tmp/gitmachine-agent /usr/local/bin/gitmachine-agent
+sudo chmod +x /usr/local/bin/gitmachine-agent
+sudo pkill gitmachine-agent 2>/dev/null || true
+
+# Create systemd service.
+sudo tee /etc/systemd/system/gitmachine-agent.service > /dev/null << 'UNIT'
+[Unit]
+Description=GitMachine Agent
+After=network.target docker.service
+
+[Service]
+ExecStart=/usr/local/bin/gitmachine-agent
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable gitmachine-agent
+sudo systemctl restart gitmachine-agent
+echo "Agent started."`
+
+	sshArgs := []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	if node.SSHKeyPath != "" {
+		sshArgs = append(sshArgs, "-i", node.SSHKeyPath)
+	}
+	sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, node.PublicIP), installScript)
+	sshCmd := execCommand("ssh", sshArgs...)
+	if out, err := sshCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("install: %s (%w)", string(out), err)
+	}
+
+	// Wait briefly for the service to start.
+	time.Sleep(2 * time.Second)
+	return nil
+}
+
+func nodeDeployAgent(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: gitmachine node deploy-agent <node-id>")
+		os.Exit(1)
+	}
+
+	_, node := resolveNode(args[0])
+
+	fmt.Print("Deploying agent...")
+	if err := deployAgentToNode(node); err != nil {
+		fmt.Fprintf(os.Stderr, "\nFailed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(" done!")
+	fmt.Printf("Agent URL: http://%s:9420\n", node.PublicIP)
 }
 
 // ==================== helpers ====================

@@ -11,16 +11,18 @@ import (
 
 const sandboxStateFileName = "sandboxes.json"
 
-// SandboxRecord persists metadata about a managed Docker sandbox.
+// SandboxRecord persists metadata about a managed sandbox (Docker or E2B).
 type SandboxRecord struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
-	NodeID    string    `json:"node_id"`
+	Provider  string    `json:"provider,omitempty"` // "docker" (default) or "e2b"
+	NodeID    string    `json:"node_id,omitempty"`
 	Image     string    `json:"image"`
 	CPUs      string    `json:"cpus,omitempty"`
 	Memory    string    `json:"memory,omitempty"`
-	DiskSize  string    `json:"disk_size,omitempty"`
-	Status    string    `json:"status"`
+	DiskSize  string        `json:"disk_size,omitempty"`
+	Ports     []PortMapping `json:"ports,omitempty"`
+	Status    string        `json:"status"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

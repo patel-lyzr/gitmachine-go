@@ -184,6 +184,18 @@ type EC2MachineConfig struct {
 	Tags map[string]string
 }
 
+// PortMapping represents a container-to-host port mapping.
+type PortMapping struct {
+	// ContainerPort is the port inside the container.
+	ContainerPort int `json:"container_port"`
+
+	// HostPort is the mapped port on the host node. Auto-assigned if zero.
+	HostPort int `json:"host_port"`
+
+	// URL is the publicly accessible URL (computed: http://<node-ip>:<host-port>).
+	URL string `json:"url,omitempty"`
+}
+
 // DockerMachineConfig holds configuration for constructing a DockerMachine.
 type DockerMachineConfig struct {
 	// Image is the Docker image to use. Defaults to "ubuntu:22.04".
@@ -201,4 +213,7 @@ type DockerMachineConfig struct {
 	// DiskSize is the writable layer storage limit (e.g. "10g", "20g"). Maps to --storage-opt size=.
 	// Requires the overlay2 storage driver with xfs and pquota mount option on the Docker host.
 	DiskSize string
+
+	// Ports lists container ports to expose. Host ports are auto-assigned if zero.
+	Ports []int
 }

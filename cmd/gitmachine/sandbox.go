@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -40,19 +41,20 @@ func handleSandbox(args []string) {
 }
 
 func sandboxCreate(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: gitmachine sandbox create <node-id> [--image ubuntu:22.04] [--name my-sandbox] [--cpus 2] [--memory 2g] [--disk 10g]")
-		os.Exit(1)
+	// Determine whether first arg is a node ID or a flag.
+	nodeIDArg := ""
+	rest := args
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		nodeIDArg = args[0]
+		rest = args[1:]
 	}
-
-	nodeIDArg := args[0]
-	rest := args[1:]
 
 	image := ""
 	name := ""
 	cpus := ""
 	memory := ""
 	diskSize := ""
+	var ports []int
 
 	for i := 0; i < len(rest); i++ {
 		switch rest[i] {
@@ -81,10 +83,25 @@ func sandboxCreate(args []string) {
 			if i < len(rest) {
 				diskSize = rest[i]
 			}
+		case "--port", "-p":
+			i++
+			if i < len(rest) {
+				p, err := strconv.Atoi(rest[i])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "invalid port: %s\n", rest[i])
+					os.Exit(1)
+				}
+				ports = append(ports, p)
+			}
 		}
 	}
 
-	_, node := resolveNode(nodeIDArg)
+	var node *gm.NodeRecord
+	if nodeIDArg != "" {
+		_, node = resolveNode(nodeIDArg)
+	} else {
+		node = autoSelectNode()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
@@ -101,6 +118,7 @@ func sandboxCreate(args []string) {
 		CPUs:     cpus,
 		Memory:   memory,
 		DiskSize: diskSize,
+		Ports:    ports,
 	}
 
 	dm := gm.NewDockerMachine(cloudMachine, config)
@@ -129,6 +147,7 @@ func sandboxCreate(args []string) {
 			CPUs:      cpus,
 			Memory:    memory,
 			DiskSize:  diskSize,
+			Ports:     dm.PortMappings(),
 			Status:    "running",
 			CreatedAt: time.Now(),
 		}
@@ -152,6 +171,9 @@ func sandboxCreate(args []string) {
 	}
 	if diskSize != "" {
 		fmt.Printf("  Disk:  %s\n", diskSize)
+	}
+	for _, pm := range dm.PortMappings() {
+		fmt.Printf("  Port:  %d -> %s\n", pm.ContainerPort, pm.URL)
 	}
 	fmt.Printf("  Node:  %s\n", shortID(node.ID))
 }
@@ -314,20 +336,18 @@ func sandboxRm(args []string) {
 	sstate, rec := resolveSandbox(args[0])
 	_, node := resolveNode(rec.NodeID)
 
+	fmt.Printf("Removing sandbox %s...", shortID(rec.ID))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	// Best-effort: try to docker rm on the node, but if the node is
+	// unreachable (stopped/terminated) just clean up the local record.
 	cloudMachine, err := connectToNode(ctx, node)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to connect to node: %v\n", err)
-		os.Exit(1)
+	if err == nil {
+		rmCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker rm -f %s", rec.ID))
+		_, _ = cloudMachine.Execute(ctx, rmCmd, nil)
 	}
-
-	fmt.Printf("Removing sandbox %s...", shortID(rec.ID))
-
-	// Force remove the container.
-	rmCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker rm -f %s", rec.ID))
-	_, _ = cloudMachine.Execute(ctx, rmCmd, nil)
 
 	_ = sstate.Remove(rec.ID)
 	fmt.Println(" done!")
@@ -374,6 +394,51 @@ func sandboxSSH(args []string) {
 }
 
 // --- sandbox helpers ---
+
+// autoSelectNode picks the running node with the fewest sandboxes (most available capacity).
+func autoSelectNode() *gm.NodeRecord {
+	state, err := gm.NewNodeState()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load node state: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Collect running nodes.
+	var running []int
+	for i := range state.Nodes {
+		if state.Nodes[i].Status == "running" && state.Nodes[i].PublicIP != "" {
+			running = append(running, i)
+		}
+	}
+	if len(running) == 0 {
+		fmt.Fprintln(os.Stderr, "No running nodes. Create one with: gitmachine node create aws")
+		os.Exit(1)
+	}
+
+	// Count sandboxes per node.
+	sstate, _ := gm.NewSandboxState()
+	sandboxCount := make(map[string]int)
+	if sstate != nil {
+		for _, s := range sstate.Sandboxes {
+			if s.Status == "running" {
+				sandboxCount[s.NodeID]++
+			}
+		}
+	}
+
+	// Pick the running node with the fewest running sandboxes.
+	best := running[0]
+	for _, idx := range running[1:] {
+		if sandboxCount[state.Nodes[idx].ID] < sandboxCount[state.Nodes[best].ID] {
+			best = idx
+		}
+	}
+
+	node := &state.Nodes[best]
+	fmt.Printf("Auto-selected node %s (%s, %d running sandbox(es))\n",
+		shortID(node.ID), node.InstanceType, sandboxCount[node.ID])
+	return node
+}
 
 func resolveSandbox(idOrPrefix string) (*gm.SandboxState, *gm.SandboxRecord) {
 	sstate, err := gm.NewSandboxState()
@@ -428,6 +493,9 @@ func printSandboxInfo(rec *gm.SandboxRecord) {
 	if rec.DiskSize != "" {
 		fmt.Printf("Disk:    %s\n", rec.DiskSize)
 	}
+	for _, pm := range rec.Ports {
+		fmt.Printf("Port:    %d -> %s\n", pm.ContainerPort, pm.URL)
+	}
 	fmt.Printf("Status:  %s\n", rec.Status)
 	fmt.Printf("Created: %s (%s ago)\n", rec.CreatedAt.Format(time.RFC3339), formatAge(time.Since(rec.CreatedAt)))
 }
@@ -451,11 +519,13 @@ func printSandboxUsage() {
 	fmt.Println("  --cpus         Number of CPUs (e.g. 1, 0.5, 2)")
 	fmt.Println("  --memory, -m   Memory limit (e.g. 512m, 2g)")
 	fmt.Println("  --disk         Disk size limit (e.g. 10g, 20g)")
+	fmt.Println("  --port, -p     Expose container port (repeatable, e.g. --port 8080 --port 3000)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  gitmachine sandbox create i-0abc123")
 	fmt.Println("  gitmachine sandbox create i-0abc --image node:20 --name my-sandbox")
 	fmt.Println("  gitmachine sandbox create i-0abc --cpus 2 --memory 4g --disk 20g")
+	fmt.Println("  gitmachine sandbox create i-0abc --image node:20 --port 3000 --port 8080")
 	fmt.Println("  gitmachine sandbox list")
 	fmt.Println("  gitmachine sandbox exec gm-a3f2b1 whoami")
 	fmt.Println("  gitmachine sandbox ssh gm-a3f2b1")
