@@ -57,6 +57,8 @@
   .badge-stopped { background: #d299221a; color: #d29922; }
   .badge-unknown { background: #f851491a; color: #f85149; }
   .badge-creating { background: #58a6ff1a; color: #58a6ff; }
+  .badge-paused { background: #bc8cff1a; color: #bc8cff; }
+  .badge-exited { background: #f851491a; color: #f85149; }
   .card-details { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; }
   .detail { font-size: 13px; }
   .detail .label { color: #484f58; }
@@ -138,6 +140,13 @@
     <div id="nodes-container"></div>
   </section>
   <section>
+    <div class="section-header">
+      <h2>Sandboxes <span class="count" id="sandbox-count">0</span></h2>
+      <button class="btn btn-green-solid" onclick="openCreateSandboxModal()" id="create-sandbox-btn">+ Create Sandbox</button>
+    </div>
+    <div id="sandboxes-container"></div>
+  </section>
+  <section>
     <h2>Credentials <span class="count" id="cred-count">0</span></h2>
     <div id="creds-container"></div>
   </section>
@@ -182,6 +191,41 @@
   </div>
 </div>
 
+<!-- Create Sandbox Modal -->
+<div class="modal-overlay" id="create-sandbox-modal" onclick="if(event.target===this)closeCreateSandboxModal()">
+  <div class="modal">
+    <h3>Create Sandbox</h3>
+    <div class="form-group">
+      <label>Node</label>
+      <select id="sandbox-node"></select>
+      <div class="hint">Select a running node to create the sandbox on</div>
+    </div>
+    <div class="form-group">
+      <label>Image</label>
+      <input id="sandbox-image" type="text" placeholder="ubuntu:22.04" />
+      <div class="hint">Docker image (leave blank for ubuntu:22.04)</div>
+    </div>
+    <div class="form-group">
+      <label>Name</label>
+      <input id="sandbox-name" type="text" placeholder="my-sandbox" />
+      <div class="hint">Optional container name (auto-generated if empty)</div>
+    </div>
+    <div class="form-group">
+      <label>Resources</label>
+      <div style="display:flex;gap:8px">
+        <input id="sandbox-cpus" type="text" placeholder="CPUs (e.g. 2)" style="flex:1" />
+        <input id="sandbox-memory" type="text" placeholder="Memory (e.g. 2g)" style="flex:1" />
+        <input id="sandbox-disk" type="text" placeholder="Disk (e.g. 10g)" style="flex:1" />
+      </div>
+      <div class="hint">Optional resource limits (leave blank for no limits)</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeCreateSandboxModal()">Cancel</button>
+      <button class="btn btn-green-solid" id="sandbox-submit" onclick="createSandbox()">Create</button>
+    </div>
+  </div>
+</div>
+
 <!-- Terminal Panel -->
 <div id="terminal-panel">
   <div id="terminal-bar">
@@ -200,8 +244,10 @@
 <script>
 let nodes = [];
 let credentials = [];
+let sandboxes = [];
 let loading = {};
 let creating = false;
+let creatingSandbox = false;
 
 // Terminal state
 let term = null;
@@ -323,11 +369,17 @@ function renderCreds() {
 
 async function fetchAll() {
   try {
-    const [n, c] = await Promise.all([api('GET', '/api/nodes'), api('GET', '/api/credentials')]);
+    const [n, c, s] = await Promise.all([
+      api('GET', '/api/nodes'),
+      api('GET', '/api/credentials'),
+      api('GET', '/api/sandboxes'),
+    ]);
     nodes = n || [];
     credentials = c || [];
+    sandboxes = s || [];
     renderNodes();
     renderCreds();
+    renderSandboxes();
     document.getElementById('last-refresh').textContent = 'Updated ' + new Date().toLocaleTimeString();
   } catch (e) {
     showToast('Failed to fetch data: ' + e.message);
@@ -552,6 +604,217 @@ window.addEventListener('resize', () => {
     fitAddon.fit();
   }
 });
+
+// --- Sandboxes ---
+
+let termSandboxId = null;
+
+function sandboxBadgeClass(status) {
+  if (status === 'running') return 'badge-running';
+  if (status === 'stopped' || status === 'exited') return 'badge-stopped';
+  if (status === 'paused') return 'badge-paused';
+  if (status === 'creating') return 'badge-creating';
+  return 'badge-unknown';
+}
+
+function renderSandboxes() {
+  const container = document.getElementById('sandboxes-container');
+  document.getElementById('sandbox-count').textContent = sandboxes.length;
+
+  const runningNodes = nodes.filter(n => n.status === 'running');
+  document.getElementById('create-sandbox-btn').style.display = runningNodes.length > 0 ? '' : 'none';
+
+  if (sandboxes.length === 0 && !creatingSandbox) {
+    container.innerHTML = '<div class="empty">No sandboxes yet. Create one on a running node.</div>';
+    return;
+  }
+  let html = '<div class="grid">';
+  if (creatingSandbox) {
+    html += `<div class="card" style="opacity:0.7">
+      <div class="card-header">
+        <div><div class="card-title"><span class="spinner"></span> Creating sandbox...</div></div>
+        <span class="badge badge-creating">creating</span>
+      </div>
+    </div>`;
+  }
+  html += sandboxes.map(s => {
+    const isLoading = loading['sb-' + s.id];
+    const isSSH = termSandboxId === s.id;
+    return `<div class="card" ${isSSH ? 'style="border-color:#bc8cff66"' : ''}>
+      <div class="card-header">
+        <div>
+          <div class="card-title">${esc(s.name)}</div>
+          <div class="card-id" title="${esc(s.id)}">${esc(s.short_id)}</div>
+        </div>
+        <span class="badge ${sandboxBadgeClass(s.status)}">${esc(s.status)}</span>
+      </div>
+      <div class="card-details">
+        <div class="detail"><span class="label">Image</span><br><span class="value">${esc(s.image)}</span></div>
+        <div class="detail"><span class="label">Node</span><br><span class="value">${esc(s.node_short)}</span></div>
+        ${s.cpus || s.memory || s.disk_size ? `<div class="detail"><span class="label">Resources</span><br><span class="value">${[s.cpus ? s.cpus + ' CPU' : '', s.memory ? s.memory + ' RAM' : '', s.disk_size ? s.disk_size + ' disk' : ''].filter(Boolean).join(', ')}</span></div>` : ''}
+        <div class="detail"><span class="label">Age</span><br><span class="value">${esc(s.age)}</span></div>
+      </div>
+      <div class="card-actions">
+        ${s.status === 'running' ? `<button class="btn btn-purple" onclick="openSandboxSSH('${esc(s.id)}','${esc(s.name)}')" ${isSSH ? 'disabled' : ''}>
+          ${isSSH ? 'SSH Active' : 'SSH'}</button>` : ''}
+        ${s.status === 'running' ? `<button class="btn" onclick="stopSandbox('${esc(s.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'stop' ? '<span class="spinner"></span>' : 'Stop'}</button>` : ''}
+        <button class="btn btn-danger" onclick="destroySandbox('${esc(s.id)}')" ${isLoading ? 'disabled' : ''}>
+          ${isLoading === 'destroy' ? '<span class="spinner"></span>' : 'Remove'}
+        </button>
+      </div>
+    </div>`;
+  }).join('');
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+function openCreateSandboxModal() {
+  const sel = document.getElementById('sandbox-node');
+  sel.innerHTML = '';
+  const runningNodes = nodes.filter(n => n.status === 'running');
+  runningNodes.forEach(n => {
+    const name = n.name || 'gitmachine';
+    sel.innerHTML += `<option value="${esc(n.id)}">${esc(name)} (${esc(truncId(n.id))})</option>`;
+  });
+  document.getElementById('sandbox-image').value = '';
+  document.getElementById('sandbox-name').value = '';
+  document.getElementById('sandbox-cpus').value = '';
+  document.getElementById('sandbox-memory').value = '';
+  document.getElementById('sandbox-disk').value = '';
+  document.getElementById('create-sandbox-modal').classList.add('open');
+}
+
+function closeCreateSandboxModal() {
+  document.getElementById('create-sandbox-modal').classList.remove('open');
+}
+
+async function createSandbox() {
+  const btn = document.getElementById('sandbox-submit');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Creating...';
+  creatingSandbox = true;
+  closeCreateSandboxModal();
+  renderSandboxes();
+
+  const body = {
+    node_id: document.getElementById('sandbox-node').value,
+    image: document.getElementById('sandbox-image').value.trim(),
+    name: document.getElementById('sandbox-name').value.trim(),
+    cpus: document.getElementById('sandbox-cpus').value.trim(),
+    memory: document.getElementById('sandbox-memory').value.trim(),
+    disk_size: document.getElementById('sandbox-disk').value.trim(),
+  };
+
+  try {
+    await api('POST', '/api/sandboxes', body);
+    showToast('Sandbox created', true);
+    await fetchAll();
+  } catch (e) {
+    showToast('Create sandbox failed: ' + e.message);
+  }
+
+  creatingSandbox = false;
+  btn.disabled = false;
+  btn.textContent = 'Create';
+  renderSandboxes();
+}
+
+async function stopSandbox(id) {
+  loading['sb-' + id] = 'stop'; renderSandboxes();
+  try {
+    await api('POST', `/api/sandboxes/${encodeURIComponent(id)}/stop`);
+    await fetchAll();
+  } catch (e) { showToast('Stop sandbox failed: ' + e.message); }
+  delete loading['sb-' + id]; renderSandboxes();
+}
+
+async function destroySandbox(id) {
+  if (!confirm('Remove sandbox ' + id.substring(0,12) + '? This cannot be undone.')) return;
+  loading['sb-' + id] = 'destroy'; renderSandboxes();
+  try {
+    await api('DELETE', `/api/sandboxes/${encodeURIComponent(id)}`);
+    if (termSandboxId === id) closeTerminal();
+    await fetchAll();
+    showToast('Sandbox removed', true);
+  } catch (e) { showToast('Remove sandbox failed: ' + e.message); }
+  delete loading['sb-' + id]; renderSandboxes();
+}
+
+function openSandboxSSH(id, name) {
+  // Close existing session.
+  if (termWs) { termWs.close(); termWs = null; }
+  if (term) { term.dispose(); term = null; }
+
+  termNodeId = null;
+  termSandboxId = id;
+  document.getElementById('term-node-label').textContent = name + ' (' + id.substring(0,12) + ')';
+
+  const panel = document.getElementById('terminal-panel');
+  panel.classList.add('open');
+  document.querySelector('main').style.paddingBottom = '380px';
+
+  const statusEl = document.getElementById('term-status');
+  statusEl.textContent = 'connecting...';
+  statusEl.className = 'term-status term-disconnected';
+
+  term = new window.Terminal({
+    cursorBlink: true, fontSize: 13,
+    fontFamily: "'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace",
+    theme: {
+      background: '#0d1117', foreground: '#c9d1d9', cursor: '#58a6ff',
+      selectionBackground: '#264f78', black: '#484f58', red: '#ff7b72',
+      green: '#3fb950', yellow: '#d29922', blue: '#58a6ff', magenta: '#bc8cff',
+      cyan: '#39c5cf', white: '#b1bac4', brightBlack: '#6e7681', brightRed: '#ffa198',
+      brightGreen: '#56d364', brightYellow: '#e3b341', brightBlue: '#79c0ff',
+      brightMagenta: '#d2a8ff', brightCyan: '#56d4dd', brightWhite: '#f0f6fc',
+    }
+  });
+
+  fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+
+  const container = document.getElementById('terminal-container');
+  container.innerHTML = '';
+  term.open(container);
+  fitAddon.fit();
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = `${proto}//${location.host}/api/sandboxes/${encodeURIComponent(id)}/ssh`;
+  termWs = new WebSocket(wsUrl);
+
+  termWs.onopen = () => {
+    statusEl.textContent = 'connected';
+    statusEl.className = 'term-status term-connected';
+    term.focus();
+  };
+  termWs.onmessage = (e) => { term.write(e.data); };
+  termWs.onclose = () => {
+    statusEl.textContent = 'disconnected';
+    statusEl.className = 'term-status term-disconnected';
+    term.write('\r\n\x1b[90m--- session closed ---\x1b[0m\r\n');
+  };
+  termWs.onerror = () => {
+    statusEl.textContent = 'error';
+    statusEl.className = 'term-status term-disconnected';
+    showToast('SSH connection failed');
+  };
+
+  term.onData((data) => {
+    if (termWs && termWs.readyState === WebSocket.OPEN) termWs.send(data);
+  });
+
+  renderNodes();
+  renderSandboxes();
+}
+
+// Update closeTerminal to also clear sandbox state.
+const origCloseTerminal = closeTerminal;
+closeTerminal = function() {
+  termSandboxId = null;
+  origCloseTerminal();
+  renderSandboxes();
+};
 
 fetchAll();
 setInterval(fetchAll, 5000);

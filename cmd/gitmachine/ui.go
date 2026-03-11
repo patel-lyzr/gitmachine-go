@@ -33,6 +33,21 @@ type nodeResponse struct {
 	CreatedAt    string `json:"created_at"`
 }
 
+type sandboxResponse struct {
+	ID        string `json:"id"`
+	ShortID   string `json:"short_id"`
+	Name      string `json:"name"`
+	NodeID    string `json:"node_id"`
+	NodeShort string `json:"node_short"`
+	Image     string `json:"image"`
+	CPUs      string `json:"cpus,omitempty"`
+	Memory    string `json:"memory,omitempty"`
+	DiskSize  string `json:"disk_size,omitempty"`
+	Status    string `json:"status"`
+	Age       string `json:"age"`
+	CreatedAt string `json:"created_at"`
+}
+
 type credentialResponse struct {
 	Name     string `json:"name"`
 	Provider string `json:"provider"`
@@ -64,6 +79,13 @@ func handleUI(args []string) {
 	mux.HandleFunc("POST /api/nodes", apiCreateNode)
 	mux.HandleFunc("GET /api/credentials", apiListCredentials)
 	mux.HandleFunc("GET /api/nodes/{id}/ssh", apiSSHWebSocket)
+
+	// Sandbox API routes.
+	mux.HandleFunc("GET /api/sandboxes", apiListSandboxes)
+	mux.HandleFunc("POST /api/sandboxes", apiCreateSandbox)
+	mux.HandleFunc("DELETE /api/sandboxes/{id}", apiDestroySandbox)
+	mux.HandleFunc("POST /api/sandboxes/{id}/stop", apiStopSandbox)
+	mux.HandleFunc("GET /api/sandboxes/{id}/ssh", apiSandboxSSHWebSocket)
 
 	// Serve embedded HTML (catch-all, must be registered last).
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
@@ -339,6 +361,383 @@ func apiListCredentials(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// --- sandbox API handlers ---
+
+func apiListSandboxes(w http.ResponseWriter, r *http.Request) {
+	sstate, err := gm.NewSandboxState()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, toSandboxResponses(sstate.Sandboxes))
+}
+
+type createSandboxRequest struct {
+	NodeID   string `json:"node_id"`
+	Image    string `json:"image"`
+	Name     string `json:"name"`
+	CPUs     string `json:"cpus"`
+	Memory   string `json:"memory"`
+	DiskSize string `json:"disk_size"`
+}
+
+func apiCreateSandbox(w http.ResponseWriter, r *http.Request) {
+	var req createSandboxRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.NodeID == "" {
+		httpError(w, http.StatusBadRequest, "node_id is required")
+		return
+	}
+
+	// Resolve node.
+	nstate, err := gm.NewNodeState()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	node := nstate.Find(req.NodeID)
+	if node == nil {
+		node = findByPrefix(nstate, req.NodeID)
+	}
+	if node == nil {
+		httpError(w, http.StatusNotFound, "node not found: "+req.NodeID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+
+	cloudMachine, err := connectToNodeAPI(ctx, node)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "connect to node: "+err.Error())
+		return
+	}
+
+	config := gm.DockerMachineConfig{
+		Image:    req.Image,
+		Name:     req.Name,
+		CPUs:     req.CPUs,
+		Memory:   req.Memory,
+		DiskSize: req.DiskSize,
+	}
+	dm := gm.NewDockerMachine(cloudMachine, config)
+
+	if err := dm.Start(ctx); err != nil {
+		httpError(w, http.StatusInternalServerError, "create sandbox: "+err.Error())
+		return
+	}
+
+	finalImage := req.Image
+	if finalImage == "" {
+		finalImage = "ubuntu:22.04"
+	}
+
+	sstate, err := gm.NewSandboxState()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "save sandbox state: "+err.Error())
+		return
+	}
+
+	rec := gm.SandboxRecord{
+		ID:        dm.ID(),
+		Name:      dm.GetName(),
+		NodeID:    node.ID,
+		Image:     finalImage,
+		CPUs:      req.CPUs,
+		Memory:    req.Memory,
+		DiskSize:  req.DiskSize,
+		Status:    "running",
+		CreatedAt: time.Now(),
+	}
+	_ = sstate.Add(rec)
+
+	writeJSON(w, toSandboxResponses([]gm.SandboxRecord{rec}))
+}
+
+func apiStopSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sstate, rec := resolveSandboxAPI(w, id)
+	if rec == nil {
+		return
+	}
+
+	node := resolveNodeForSandboxAPI(w, rec.NodeID)
+	if node == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	cloudMachine, err := connectToNodeAPI(ctx, node)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "connect to node: "+err.Error())
+		return
+	}
+
+	stopCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker stop %s", rec.ID))
+	result, err := cloudMachine.Execute(ctx, stopCmd, nil)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if result.ExitCode != 0 {
+		httpError(w, http.StatusInternalServerError, result.Stderr)
+		return
+	}
+
+	_ = sstate.Update(rec.ID, func(r *gm.SandboxRecord) { r.Status = "stopped" })
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func apiDestroySandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sstate, rec := resolveSandboxAPI(w, id)
+	if rec == nil {
+		return
+	}
+
+	node := resolveNodeForSandboxAPI(w, rec.NodeID)
+	if node == nil {
+		// Node gone, just remove the record.
+		_ = sstate.Remove(rec.ID)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+
+	cloudMachine, err := connectToNodeAPI(ctx, node)
+	if err == nil {
+		rmCmd := nodeDockerCmd(ctx, cloudMachine, fmt.Sprintf("docker rm -f %s", rec.ID))
+		_, _ = cloudMachine.Execute(ctx, rmCmd, nil)
+	}
+
+	_ = sstate.Remove(rec.ID)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func apiSandboxSSHWebSocket(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	sstate, err := gm.NewSandboxState()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	rec := sstate.Find(id)
+	if rec == nil {
+		rec = sstate.FindByPrefix(id)
+	}
+	if rec == nil {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	// Find the parent node.
+	nstate, err := gm.NewNodeState()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	node := nstate.Find(rec.NodeID)
+	if node == nil {
+		http.Error(w, "parent node not found", http.StatusNotFound)
+		return
+	}
+	if node.PublicIP == "" {
+		http.Error(w, "node has no public IP", http.StatusBadRequest)
+		return
+	}
+
+	// Read the private key.
+	keyData, err := os.ReadFile(node.SSHKeyPath)
+	if err != nil {
+		http.Error(w, "cannot read SSH key: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	signer, err := ssh.ParsePrivateKey(keyData)
+	if err != nil {
+		http.Error(w, "invalid SSH key: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	sshUser := node.SSHUser
+	if sshUser == "" {
+		sshUser = "ubuntu"
+	}
+
+	sshCfg := &ssh.ClientConfig{
+		User:            sshUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
+		Timeout:         10 * time.Second,
+	}
+
+	sshClient, err := ssh.Dial("tcp", net.JoinHostPort(node.PublicIP, "22"), sshCfg)
+	if err != nil {
+		http.Error(w, "SSH connect failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	session, err := sshClient.NewSession()
+	if err != nil {
+		sshClient.Close()
+		http.Error(w, "SSH session failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+	if err := session.RequestPty("xterm-256color", 24, 80, modes); err != nil {
+		session.Close()
+		sshClient.Close()
+		http.Error(w, "PTY request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	stdinPipe, err := session.StdinPipe()
+	if err != nil {
+		session.Close()
+		sshClient.Close()
+		http.Error(w, "stdin pipe failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	stdoutPipe, err := session.StdoutPipe()
+	if err != nil {
+		session.Close()
+		sshClient.Close()
+		http.Error(w, "stdout pipe failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Start a shell running docker exec into the container.
+	dockerExecCmd := fmt.Sprintf("sudo docker exec -it %s /bin/bash || sudo docker exec -it %s /bin/sh", rec.ID, rec.ID)
+	if err := session.Start(dockerExecCmd); err != nil {
+		session.Close()
+		sshClient.Close()
+		http.Error(w, "docker exec failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Upgrade to WebSocket.
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		session.Close()
+		sshClient.Close()
+		return
+	}
+
+	// SSH stdout -> WebSocket.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := stdoutPipe.Read(buf)
+			if n > 0 {
+				if writeErr := conn.WriteMessage(websocket.TextMessage, buf[:n]); writeErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		conn.Close()
+	}()
+
+	// WebSocket -> SSH stdin.
+	go func() {
+		defer func() {
+			stdinPipe.Close()
+			session.Close()
+			sshClient.Close()
+			conn.Close()
+		}()
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				break
+			}
+			if _, err := stdinPipe.Write(msg); err != nil {
+				break
+			}
+		}
+	}()
+}
+
+func resolveSandboxAPI(w http.ResponseWriter, idOrPrefix string) (*gm.SandboxState, *gm.SandboxRecord) {
+	sstate, err := gm.NewSandboxState()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return nil, nil
+	}
+	rec := sstate.Find(idOrPrefix)
+	if rec == nil {
+		rec = sstate.FindByPrefix(idOrPrefix)
+	}
+	if rec == nil {
+		httpError(w, http.StatusNotFound, "sandbox not found: "+idOrPrefix)
+		return nil, nil
+	}
+	return sstate, rec
+}
+
+func resolveNodeForSandboxAPI(w http.ResponseWriter, nodeID string) *gm.NodeRecord {
+	nstate, err := gm.NewNodeState()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return nil
+	}
+	node := nstate.Find(nodeID)
+	if node == nil {
+		httpError(w, http.StatusNotFound, "parent node not found: "+nodeID)
+		return nil
+	}
+	return node
+}
+
+func connectToNodeAPI(ctx context.Context, node *gm.NodeRecord) (*gm.CloudMachine, error) {
+	provider := providerForNode(node)
+	return gm.ConnectCloudMachine(ctx, provider, node.ID)
+}
+
+func toSandboxResponses(sandboxes []gm.SandboxRecord) []sandboxResponse {
+	out := make([]sandboxResponse, len(sandboxes))
+	for i, s := range sandboxes {
+		sid := s.ID
+		if len(sid) > 12 {
+			sid = sid[:12]
+		}
+		nid := s.NodeID
+		if len(nid) > 12 {
+			nid = nid[:12]
+		}
+		out[i] = sandboxResponse{
+			ID:        s.ID,
+			ShortID:   sid,
+			Name:      s.Name,
+			NodeID:    s.NodeID,
+			NodeShort: nid,
+			Image:     s.Image,
+			CPUs:      s.CPUs,
+			Memory:    s.Memory,
+			DiskSize:  s.DiskSize,
+			Status:    s.Status,
+			Age:       formatAge(time.Since(s.CreatedAt)),
+			CreatedAt: s.CreatedAt.Format(time.RFC3339),
+		}
+	}
+	return out
+}
+
 // --- helpers ---
 
 func resolveNodeAPI(w http.ResponseWriter, idOrPrefix string) (*gm.NodeState, *gm.NodeRecord) {
@@ -370,6 +769,14 @@ func providerForNodeAPI(node *gm.NodeRecord) (gm.CloudProvider, error) {
 				config.AccessKeyID = cred.Fields["access_key_id"]
 				config.SecretAccessKey = cred.Fields["secret_access_key"]
 			}
+		}
+		if node.SSHKeyPath != "" {
+			if keyData, err := os.ReadFile(node.SSHKeyPath); err == nil {
+				config.PrivateKeyPEM = string(keyData)
+			}
+		}
+		if node.SSHUser != "" {
+			config.SSHUser = node.SSHUser
 		}
 		return gm.NewEC2Provider(config), nil
 	default:

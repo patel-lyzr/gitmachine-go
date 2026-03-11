@@ -183,3 +183,22 @@ type EC2MachineConfig struct {
 	// Tags are applied to all created AWS resources.
 	Tags map[string]string
 }
+
+// DockerMachineConfig holds configuration for constructing a DockerMachine.
+type DockerMachineConfig struct {
+	// Image is the Docker image to use. Defaults to "ubuntu:22.04".
+	Image string
+
+	// Name is the container name. Auto-generated if empty.
+	Name string
+
+	// CPUs is the number of CPUs to allocate (e.g. "1", "0.5", "2"). Maps to --cpus.
+	CPUs string
+
+	// Memory is the memory limit (e.g. "512m", "2g"). Maps to --memory.
+	Memory string
+
+	// DiskSize is the writable layer storage limit (e.g. "10g", "20g"). Maps to --storage-opt size=.
+	// Requires the overlay2 storage driver with xfs and pquota mount option on the Docker host.
+	DiskSize string
+}

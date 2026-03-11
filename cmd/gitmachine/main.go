@@ -37,6 +37,12 @@ func main() {
 			os.Exit(1)
 		}
 		handleAuth(args)
+	case "sandbox":
+		if len(args) == 0 {
+			printSandboxUsage()
+			os.Exit(1)
+		}
+		handleSandbox(args)
 	case "ui":
 		handleUI(args)
 	case "version":
@@ -600,6 +606,12 @@ func nodeDestroy(args []string) {
 
 	state.RemoveKey(node.ID)
 	_ = state.Remove(node.ID)
+
+	// Clean up orphaned sandbox records for this node.
+	if sstate, err := gm.NewSandboxState(); err == nil {
+		_ = sstate.RemoveForNode(node.ID)
+	}
+
 	fmt.Println(" done!")
 }
 
@@ -687,6 +699,15 @@ func providerForNode(node *gm.NodeRecord) gm.CloudProvider {
 				config.SecretAccessKey = cred.Fields["secret_access_key"]
 			}
 		}
+		// Load stored private key so SSH works on reconnect.
+		if node.SSHKeyPath != "" {
+			if keyData, err := os.ReadFile(node.SSHKeyPath); err == nil {
+				config.PrivateKeyPEM = string(keyData)
+			}
+		}
+		if node.SSHUser != "" {
+			config.SSHUser = node.SSHUser
+		}
 		return gm.NewEC2Provider(config)
 	default:
 		fmt.Fprintf(os.Stderr, "unsupported provider: %s\n", node.Provider)
@@ -732,6 +753,7 @@ func printUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  auth       Manage cloud credentials")
 	fmt.Println("  node       Manage cloud compute nodes")
+	fmt.Println("  sandbox    Manage Docker sandboxes on nodes")
 	fmt.Println("  ui         Open web dashboard")
 	fmt.Println("  version    Show version")
 	fmt.Println("  help       Show this help")

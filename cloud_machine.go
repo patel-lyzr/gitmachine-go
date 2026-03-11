@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -308,6 +309,43 @@ func (m *CloudMachine) ListFiles(ctx context.Context, path string) ([]string, er
 		return []string{}, nil
 	}
 	return lines, nil
+}
+
+// RunWithStdin runs a command over SSH, piping the given reader as stdin.
+func (m *CloudMachine) RunWithStdin(ctx context.Context, command string, stdin io.Reader) (*ExecutionResult, error) {
+	m.mu.Lock()
+	if m.state != StateRunning || m.sshClient == nil {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("machine is %s — call Start() or Resume() first", m.state)
+	}
+	client := m.sshClient
+	m.mu.Unlock()
+
+	session, err := client.NewSession()
+	if err != nil {
+		return nil, fmt.Errorf("create ssh session: %w", err)
+	}
+	defer session.Close()
+
+	session.Stdin = stdin
+	var stdout, stderr bytes.Buffer
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+
+	exitCode := 0
+	if err := session.Run(command); err != nil {
+		if exitErr, ok := err.(*ssh.ExitError); ok {
+			exitCode = exitErr.ExitStatus()
+		} else {
+			return nil, fmt.Errorf("execute command: %w", err)
+		}
+	}
+
+	return &ExecutionResult{
+		ExitCode: exitCode,
+		Stdout:   stdout.String(),
+		Stderr:   stderr.String(),
+	}, nil
 }
 
 // --- SSH internals ---
