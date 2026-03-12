@@ -108,11 +108,20 @@ func main() {
 	// Git
 	mux.HandleFunc("POST /git/clone", handleGitClone)
 	mux.HandleFunc("GET /git/status", handleGitStatus)
+	mux.HandleFunc("POST /git/add", handleGitAdd)
 	mux.HandleFunc("POST /git/commit", handleGitCommit)
 	mux.HandleFunc("POST /git/push", handleGitPush)
 	mux.HandleFunc("POST /git/pull", handleGitPull)
 	mux.HandleFunc("GET /git/branches", handleGitBranches)
 	mux.HandleFunc("GET /git/log", handleGitLog)
+	mux.HandleFunc("POST /git/branch/create", handleGitBranchCreate)
+	mux.HandleFunc("POST /git/branch/checkout", handleGitBranchCheckout)
+	mux.HandleFunc("POST /git/branch/delete", handleGitBranchDelete)
+	mux.HandleFunc("POST /git/remote/add", handleGitRemoteAdd)
+	mux.HandleFunc("POST /git/config", handleGitSetConfig)
+	mux.HandleFunc("GET /git/config", handleGitGetConfig)
+	mux.HandleFunc("POST /git/configure-user", handleGitConfigureUser)
+	mux.HandleFunc("POST /git/authenticate", handleGitAuthenticate)
 
 	// Ports
 	mux.HandleFunc("GET /ports", handlePortList)
@@ -1120,15 +1129,54 @@ func handleGitStatus(w http.ResponseWriter, r *http.Request) {
 	if dir == "" {
 		dir = "."
 	}
-	out, exitCode := gitCmd(dir, "status", "--porcelain")
-	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+
+	// Get porcelain status with branch info.
+	out, exitCode := gitCmd(dir, "status", "--porcelain=v2", "--branch")
+
+	currentBranch := ""
+	ahead, behind := 0, 0
+	var fileStatus []map[string]string
+
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "# branch.head ") {
+			currentBranch = strings.TrimPrefix(line, "# branch.head ")
+		} else if strings.HasPrefix(line, "# branch.ab ") {
+			fmt.Sscanf(strings.TrimPrefix(line, "# branch.ab "), "+%d -%d", &ahead, &behind)
+		} else if len(line) > 2 && (line[0] == '1' || line[0] == '2' || line[0] == 'u' || line[0] == '?') {
+			parts := strings.Fields(line)
+			if len(parts) >= 2 {
+				entry := map[string]string{"status": parts[1]}
+				if len(parts) > 8 {
+					entry["path"] = parts[len(parts)-1]
+				} else if len(parts) > 1 {
+					entry["path"] = parts[len(parts)-1]
+				}
+				fileStatus = append(fileStatus, entry)
+			}
+		}
+	}
+
+	// Also get raw porcelain for backwards compat.
+	rawOut, _ := gitCmd(dir, "status", "--porcelain")
+
+	writeJSON(w, map[string]interface{}{
+		"output":         rawOut,
+		"exit_code":      exitCode,
+		"current_branch": currentBranch,
+		"ahead":          ahead,
+		"behind":         behind,
+		"file_status":    fileStatus,
+	})
 }
 
 func handleGitCommit(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path    string `json:"path"`
-		Message string `json:"message"`
-		AddAll  bool   `json:"add_all"`
+		Path        string `json:"path"`
+		Message     string `json:"message"`
+		AddAll      bool   `json:"add_all"`
+		AuthorName  string `json:"author_name"`
+		AuthorEmail string `json:"author_email"`
+		AllowEmpty  bool   `json:"allow_empty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Message == "" {
 		httpError(w, http.StatusBadRequest, "message required")
@@ -1142,17 +1190,26 @@ func handleGitCommit(w http.ResponseWriter, r *http.Request) {
 		gitCmd(req.Path, "add", "-A")
 	}
 
-	out, exitCode := gitCmd(req.Path, "commit", "-m", req.Message)
+	args := []string{"commit", "-m", req.Message}
+	if req.AuthorName != "" && req.AuthorEmail != "" {
+		args = append(args, "--author", fmt.Sprintf("%s <%s>", req.AuthorName, req.AuthorEmail))
+	}
+	if req.AllowEmpty {
+		args = append(args, "--allow-empty")
+	}
+
+	out, exitCode := gitCmd(req.Path, args...)
 	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
 }
 
 func handleGitPush(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Path     string `json:"path"`
-		Remote   string `json:"remote"`
-		Branch   string `json:"branch"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Path        string `json:"path"`
+		Remote      string `json:"remote"`
+		Branch      string `json:"branch"`
+		Username    string `json:"username"`
+		Password    string `json:"password"`
+		SetUpstream bool   `json:"set_upstream"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	if req.Path == "" {
@@ -1160,6 +1217,9 @@ func handleGitPush(w http.ResponseWriter, r *http.Request) {
 	}
 
 	args := []string{"push"}
+	if req.SetUpstream {
+		args = append(args, "-u")
+	}
 	if req.Remote != "" {
 		args = append(args, req.Remote)
 	}
@@ -1204,14 +1264,17 @@ func handleGitBranches(w http.ResponseWriter, r *http.Request) {
 	out, exitCode := gitCmd(dir, "branch", "-a", "--no-color")
 
 	var branches []string
+	currentBranch := ""
 	for _, line := range strings.Split(out, "\n") {
-		b := strings.TrimSpace(line)
-		b = strings.TrimPrefix(b, "* ")
-		if b != "" {
-			branches = append(branches, b)
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "* ") {
+			currentBranch = strings.TrimPrefix(trimmed, "* ")
+			branches = append(branches, currentBranch)
+		} else if trimmed != "" {
+			branches = append(branches, trimmed)
 		}
 	}
-	writeJSON(w, map[string]interface{}{"branches": branches, "exit_code": exitCode})
+	writeJSON(w, map[string]interface{}{"branches": branches, "current_branch": currentBranch, "exit_code": exitCode})
 }
 
 func handleGitLog(w http.ResponseWriter, r *http.Request) {
@@ -1226,6 +1289,228 @@ func handleGitLog(w http.ResponseWriter, r *http.Request) {
 
 	out, exitCode := gitCmd(dir, "log", "--oneline", "-n", limit, "--no-color")
 	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path  string   `json:"path"`
+		Files []string `json:"files"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	args := []string{"add"}
+	if len(req.Files) == 0 {
+		args = append(args, "-A")
+	} else {
+		args = append(args, "--")
+		args = append(args, req.Files...)
+	}
+
+	out, exitCode := gitCmd(req.Path, args...)
+	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitBranchCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string `json:"path"`
+		Branch string `json:"branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Branch == "" {
+		httpError(w, http.StatusBadRequest, "branch required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	out, exitCode := gitCmd(req.Path, "checkout", "-b", req.Branch)
+	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitBranchCheckout(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string `json:"path"`
+		Branch string `json:"branch"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Branch == "" {
+		httpError(w, http.StatusBadRequest, "branch required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	out, exitCode := gitCmd(req.Path, "checkout", req.Branch)
+	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitBranchDelete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path   string `json:"path"`
+		Branch string `json:"branch"`
+		Force  bool   `json:"force"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Branch == "" {
+		httpError(w, http.StatusBadRequest, "branch required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	flag := "-d"
+	if req.Force {
+		flag = "-D"
+	}
+	out, exitCode := gitCmd(req.Path, "branch", flag, req.Branch)
+	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitRemoteAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path      string `json:"path"`
+		Name      string `json:"name"`
+		URL       string `json:"url"`
+		Fetch     bool   `json:"fetch"`
+		Overwrite bool   `json:"overwrite"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.URL == "" {
+		httpError(w, http.StatusBadRequest, "name and url required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	if req.Overwrite {
+		// Try set-url first, fall back to add if remote doesn't exist.
+		_, exitCode := gitCmd(req.Path, "remote", "set-url", req.Name, req.URL)
+		if exitCode != 0 {
+			gitCmd(req.Path, "remote", "add", req.Name, req.URL)
+		}
+	} else {
+		out, exitCode := gitCmd(req.Path, "remote", "add", req.Name, req.URL)
+		if exitCode != 0 {
+			writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+			return
+		}
+	}
+
+	if req.Fetch {
+		out, exitCode := gitCmd(req.Path, "fetch", req.Name)
+		writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{"output": "ok", "exit_code": 0})
+}
+
+func handleGitSetConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path  string `json:"path"`
+		Key   string `json:"key"`
+		Value string `json:"value"`
+		Scope string `json:"scope"` // "global" or "local"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
+		httpError(w, http.StatusBadRequest, "key required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	args := []string{"config"}
+	if req.Scope == "global" {
+		args = append(args, "--global")
+	}
+	args = append(args, req.Key, req.Value)
+
+	out, exitCode := gitCmd(req.Path, args...)
+	writeJSON(w, map[string]interface{}{"output": out, "exit_code": exitCode})
+}
+
+func handleGitGetConfig(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("path")
+	if dir == "" {
+		dir = "."
+	}
+	key := r.URL.Query().Get("key")
+	scope := r.URL.Query().Get("scope")
+
+	args := []string{"config"}
+	if scope == "global" {
+		args = append(args, "--global")
+	}
+	args = append(args, "--get", key)
+
+	out, exitCode := gitCmd(dir, args...)
+	writeJSON(w, map[string]interface{}{"value": out, "exit_code": exitCode})
+}
+
+func handleGitConfigureUser(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Path  string `json:"path"`
+		Name  string `json:"name"`
+		Email string `json:"email"`
+		Scope string `json:"scope"` // "global" or "local"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Name == "" || req.Email == "" {
+		httpError(w, http.StatusBadRequest, "name and email required")
+		return
+	}
+	if req.Path == "" {
+		req.Path = "."
+	}
+
+	scopeFlag := "--global"
+	if req.Scope == "local" {
+		scopeFlag = "--local"
+	}
+
+	gitCmd(req.Path, "config", scopeFlag, "user.name", req.Name)
+	gitCmd(req.Path, "config", scopeFlag, "user.email", req.Email)
+	writeJSON(w, map[string]interface{}{"output": "ok", "exit_code": 0})
+}
+
+func handleGitAuthenticate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Host     string `json:"host"`
+		Protocol string `json:"protocol"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+		httpError(w, http.StatusBadRequest, "username and password required")
+		return
+	}
+	if req.Host == "" {
+		req.Host = "github.com"
+	}
+	if req.Protocol == "" {
+		req.Protocol = "https"
+	}
+
+	// Configure git to use the store credential helper.
+	gitCmd(".", "config", "--global", "credential.helper", "store")
+
+	// Write credentials to ~/.git-credentials.
+	credLine := fmt.Sprintf("%s://%s:%s@%s\n", req.Protocol, req.Username, req.Password, req.Host)
+	credFile := filepath.Join(os.Getenv("HOME"), ".git-credentials")
+
+	// Append to file (may already have entries).
+	f, err := os.OpenFile(credFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to write credentials: "+err.Error())
+		return
+	}
+	f.WriteString(credLine)
+	f.Close()
+
+	writeJSON(w, map[string]interface{}{"output": "ok", "exit_code": 0})
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
