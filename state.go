@@ -104,6 +104,19 @@ func (s *NodeState) SaveKey(id string, privateKeyPEM string) (string, error) {
 	return keyPath, nil
 }
 
+// KeyPath returns the path to the SSH key for a node if it exists on disk, or empty string.
+func (s *NodeState) KeyPath(id string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	keyPath := filepath.Join(home, ".gitmachine", "keys", id+".pem")
+	if _, err := os.Stat(keyPath); err == nil {
+		return keyPath
+	}
+	return ""
+}
+
 // RemoveKey deletes the key file for a node.
 func (s *NodeState) RemoveKey(id string) {
 	home, _ := os.UserHomeDir()

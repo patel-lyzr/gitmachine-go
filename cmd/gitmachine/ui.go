@@ -74,8 +74,23 @@ func handleUI(args []string) {
 
 	mux := http.NewServeMux()
 
+	// Sync nodes from AWS on startup.
+	go func() {
+		log.Println("sync: discovering AWS instances on startup...")
+		result, _, err := gm.SyncNodesFromAWSWithCreds(context.Background())
+		if err != nil {
+			log.Printf("sync: AWS sync failed: %v", err)
+		} else {
+			log.Printf("sync: added %d, updated %d nodes", len(result.Added), len(result.Updated))
+		}
+	}()
+
+	// Background agent health checker — auto-deploys to unreachable nodes.
+	go agentHealthLoop()
+
 	// API routes.
 	mux.HandleFunc("GET /api/nodes", apiListNodes)
+	mux.HandleFunc("POST /api/nodes/sync", apiSyncNodes)
 	mux.HandleFunc("POST /api/nodes/refresh-all", apiRefreshAllNodes)
 	mux.HandleFunc("POST /api/nodes/{id}/refresh", apiRefreshNode)
 	mux.HandleFunc("POST /api/nodes/{id}/stop", apiStopNode)
@@ -166,6 +181,28 @@ func apiListNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, toNodeResponses(state.Nodes))
+}
+
+func apiSyncNodes(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	result, state, err := gm.SyncNodesFromAWSWithCreds(ctx)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "sync failed: "+err.Error())
+		return
+	}
+
+	// Return the full node list after sync.
+	if state != nil {
+		writeJSON(w, map[string]interface{}{
+			"added":   result.Added,
+			"updated": result.Updated,
+			"nodes":   toNodeResponses(state.Nodes),
+		})
+	} else {
+		writeJSON(w, result)
+	}
 }
 
 func apiRefreshAllNodes(w http.ResponseWriter, r *http.Request) {

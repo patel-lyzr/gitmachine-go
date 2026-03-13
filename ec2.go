@@ -151,11 +151,14 @@ func (p *EC2Provider) Launch(ctx context.Context) (*CloudInstance, error) {
 		input.SubnetId = aws.String(p.subnetID)
 	}
 
-	allTags := []ec2types.Tag{{
-		Key:   aws.String("Name"),
-		Value: aws.String("gitmachine"),
-	}}
+	// Merge p.tags into allTags, but never duplicate the "Name" key.
+	tagMap := map[string]string{"Name": "gitmachine"}
 	for k, v := range p.tags {
+		tagMap[k] = v
+	}
+	allTags := make([]ec2types.Tag, 0, len(tagMap))
+	for k, v := range tagMap {
+		k, v := k, v
 		allTags = append(allTags, ec2types.Tag{
 			Key:   aws.String(k),
 			Value: aws.String(v),
@@ -413,6 +416,77 @@ func (p *EC2Provider) createSecurityGroup(ctx context.Context) error {
 	// Track even the shared SG so we can clean it up when the last node is destroyed.
 	p.createdSGID = sgID
 	return nil
+}
+
+// DiscoveredInstance holds metadata about an EC2 instance found via tag discovery.
+type DiscoveredInstance struct {
+	ID           string
+	PublicIP     string
+	State        string // "running", "stopped", etc.
+	InstanceType string
+	Region       string
+	KeyName      string // AWS key pair name used at launch
+	LaunchTime   time.Time
+	Tags         map[string]string
+}
+
+// DiscoverInstances finds all EC2 instances tagged with Name=gitmachine.
+func (p *EC2Provider) DiscoverInstances(ctx context.Context) ([]DiscoveredInstance, error) {
+	input := &ec2.DescribeInstancesInput{
+		Filters: []ec2types.Filter{
+			{
+				Name:   aws.String("tag:Name"),
+				Values: []string{"gitmachine"},
+			},
+			{
+				Name:   aws.String("instance-state-name"),
+				Values: []string{"running", "stopped", "pending", "stopping"},
+			},
+		},
+	}
+
+	desc, err := p.ec2Client.DescribeInstances(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("DescribeInstances: %w", err)
+	}
+
+	var results []DiscoveredInstance
+	for _, res := range desc.Reservations {
+		for _, inst := range res.Instances {
+			di := DiscoveredInstance{
+				ID:    *inst.InstanceId,
+				State: string(inst.State.Name),
+				Tags:  make(map[string]string),
+			}
+			if inst.PublicIpAddress != nil {
+				di.PublicIP = *inst.PublicIpAddress
+			}
+			if inst.InstanceType != "" {
+				di.InstanceType = string(inst.InstanceType)
+			}
+			if inst.Placement != nil && inst.Placement.AvailabilityZone != nil {
+				az := *inst.Placement.AvailabilityZone
+				// Strip the trailing letter to get region (e.g. us-east-1a -> us-east-1).
+				if len(az) > 0 {
+					di.Region = az[:len(az)-1]
+				}
+			}
+			if inst.KeyName != nil {
+				di.KeyName = *inst.KeyName
+			}
+			if inst.LaunchTime != nil {
+				di.LaunchTime = *inst.LaunchTime
+			}
+			for _, tag := range inst.Tags {
+				if tag.Key != nil && tag.Value != nil {
+					di.Tags[*tag.Key] = *tag.Value
+				}
+			}
+			results = append(results, di)
+		}
+	}
+
+	return results, nil
 }
 
 // Compile-time check.

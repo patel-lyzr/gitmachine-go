@@ -18,6 +18,7 @@
 //	GET    /files/info?path=         — file info (size, perms, modtime)
 //	GET    /files/search?path=&q=    — search file contents (grep)
 //	POST   /files/chmod              — change file permissions
+//	GET    /files/watch?path=&recursive= — WebSocket filesystem watcher
 //
 //	# Process
 //	POST   /process/exec             — execute command (blocking)
@@ -66,6 +67,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
 )
 
@@ -89,6 +91,7 @@ func main() {
 	mux.HandleFunc("GET /files/info", handleFileInfo)
 	mux.HandleFunc("GET /files/search", handleFileSearch)
 	mux.HandleFunc("POST /files/chmod", handleFileChmod)
+	mux.HandleFunc("GET /files/watch", handleFileWatch)
 
 	// Process
 	mux.HandleFunc("POST /process/exec", handleProcessExec)
@@ -1514,6 +1517,123 @@ func handleGitAuthenticate(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Utilities ───────────────────────────────────────────────────────────────
+
+// ── Filesystem Watch (WebSocket) ──────────────────────────────────────
+
+func handleFileWatch(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		path = "/"
+	}
+	recursive := r.URL.Query().Get("recursive") == "true"
+
+	// Verify the path exists and is a directory.
+	info, err := os.Stat(path)
+	if err != nil {
+		httpError(w, http.StatusNotFound, "path not found: "+err.Error())
+		return
+	}
+	if !info.IsDir() {
+		httpError(w, http.StatusBadRequest, "path is not a directory")
+		return
+	}
+
+	// Upgrade to WebSocket.
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+
+	// Create fsnotify watcher.
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		conn.WriteJSON(map[string]string{"error": "failed to create watcher: " + err.Error()})
+		return
+	}
+	defer watcher.Close()
+
+	// Add paths.
+	if recursive {
+		filepath.Walk(path, func(p string, fi os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if fi.IsDir() {
+				watcher.Add(p)
+			}
+			return nil
+		})
+	} else {
+		watcher.Add(path)
+	}
+
+	conn.WriteJSON(map[string]string{"type": "control", "status": "watching"})
+	log.Printf("watch: started on %s (recursive=%v)", path, recursive)
+
+	// Close watcher when client disconnects.
+	done := make(chan struct{})
+	go func() {
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				close(done)
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			eventType := fsEventType(event.Op)
+			if eventType == "" {
+				continue
+			}
+			msg := map[string]string{
+				"type": eventType,
+				"name": event.Name,
+			}
+			if err := conn.WriteJSON(msg); err != nil {
+				return
+			}
+			// If a new directory was created and recursive mode is on, watch it.
+			if recursive && event.Op&fsnotify.Create != 0 {
+				if fi, err := os.Stat(event.Name); err == nil && fi.IsDir() {
+					watcher.Add(event.Name)
+				}
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			conn.WriteJSON(map[string]string{"type": "error", "message": err.Error()})
+		case <-done:
+			log.Printf("watch: client disconnected, stopping watcher on %s", path)
+			return
+		}
+	}
+}
+
+func fsEventType(op fsnotify.Op) string {
+	switch {
+	case op&fsnotify.Create != 0:
+		return "CREATE"
+	case op&fsnotify.Write != 0:
+		return "WRITE"
+	case op&fsnotify.Remove != 0:
+		return "REMOVE"
+	case op&fsnotify.Rename != 0:
+		return "RENAME"
+	case op&fsnotify.Chmod != 0:
+		return "CHMOD"
+	default:
+		return ""
+	}
+}
 
 func generateID() string {
 	b := make([]byte, 8)

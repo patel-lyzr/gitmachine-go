@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -224,4 +225,120 @@ func agentRemoveSandbox(node *gm.NodeRecord, sandboxID string) error {
 		return fmt.Errorf("agent rm: status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// --- Background agent health checker ---
+
+const (
+	healthCheckInterval = 30 * time.Second // How often to check agent health.
+	unreachableTimeout  = 60 * time.Second // How long unreachable before auto-deploy.
+)
+
+var (
+	// Tracks when each node was first seen as unreachable.
+	unreachableSince   = make(map[string]time.Time)
+	unreachableSinceMu sync.Mutex
+	// Tracks nodes currently being deployed to (prevent concurrent deploys).
+	deployingNodes   = make(map[string]bool)
+	deployingNodesMu sync.Mutex
+)
+
+// agentHealthLoop periodically checks running nodes and auto-deploys the agent
+// if it has been unreachable for longer than unreachableTimeout.
+func agentHealthLoop() {
+	// Wait for initial sync to finish before starting checks.
+	time.Sleep(10 * time.Second)
+	log.Println("health: background agent health checker started")
+
+	for {
+		checkAndDeployAgents()
+		time.Sleep(healthCheckInterval)
+	}
+}
+
+func checkAndDeployAgents() {
+	state, err := gm.NewNodeState()
+	if err != nil {
+		return
+	}
+
+	for i := range state.Nodes {
+		node := &state.Nodes[i]
+		if node.Status != "running" || node.PublicIP == "" {
+			// Node not running — clear any unreachable tracking.
+			unreachableSinceMu.Lock()
+			delete(unreachableSince, node.ID)
+			unreachableSinceMu.Unlock()
+			continue
+		}
+
+		reachable := isAgentAvailable(node)
+
+		unreachableSinceMu.Lock()
+		if reachable {
+			// Agent is healthy — clear tracking.
+			delete(unreachableSince, node.ID)
+			unreachableSinceMu.Unlock()
+			continue
+		}
+
+		// Agent is unreachable.
+		firstSeen, tracked := unreachableSince[node.ID]
+		if !tracked {
+			unreachableSince[node.ID] = time.Now()
+			unreachableSinceMu.Unlock()
+			log.Printf("health: agent unreachable on %s, will auto-deploy in %s", node.ID, unreachableTimeout)
+			continue
+		}
+		unreachableSinceMu.Unlock()
+
+		// Check if we've waited long enough.
+		if time.Since(firstSeen) < unreachableTimeout {
+			continue
+		}
+
+		// Skip nodes without SSH keys — can't deploy without them.
+		if node.SSHKeyPath == "" {
+			log.Printf("health: skipping auto-deploy for %s — no SSH key available. Destroy and recreate, or manually place key at ~/.gitmachine/keys/%s.pem", node.ID, node.ID)
+			// Clear tracking so we don't spam the log every 30s.
+			unreachableSinceMu.Lock()
+			delete(unreachableSince, node.ID)
+			unreachableSinceMu.Unlock()
+			continue
+		}
+
+		// Check if already deploying.
+		deployingNodesMu.Lock()
+		if deployingNodes[node.ID] {
+			deployingNodesMu.Unlock()
+			continue
+		}
+		deployingNodes[node.ID] = true
+		deployingNodesMu.Unlock()
+
+		// Auto-deploy in background.
+		nodeCopy := *node
+		go func() {
+			defer func() {
+				deployingNodesMu.Lock()
+				delete(deployingNodes, nodeCopy.ID)
+				deployingNodesMu.Unlock()
+			}()
+
+			log.Printf("health: auto-deploying agent to %s (%s) — unreachable for %s",
+				nodeCopy.ID, nodeCopy.PublicIP, time.Since(firstSeen).Round(time.Second))
+			invalidateAgentCache(nodeCopy.ID)
+
+			if err := deployAgentToNode(&nodeCopy); err != nil {
+				log.Printf("health: auto-deploy FAILED for %s: %v", nodeCopy.ID, err)
+			} else {
+				log.Printf("health: auto-deploy SUCCESS for %s", nodeCopy.ID)
+				invalidateAgentCache(nodeCopy.ID)
+				// Clear unreachable tracking on success.
+				unreachableSinceMu.Lock()
+				delete(unreachableSince, nodeCopy.ID)
+				unreachableSinceMu.Unlock()
+			}
+		}()
+	}
 }

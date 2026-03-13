@@ -257,6 +257,8 @@ func handleNode(args []string) {
 		nodeDestroy(rest)
 	case "ssh":
 		nodeSSH(rest)
+	case "sync":
+		nodeSync()
 	case "deploy-agent":
 		nodeDeployAgent(rest)
 	case "help", "--help", "-h":
@@ -700,6 +702,9 @@ func deployAgentToNode(node *gm.NodeRecord) error {
 	if node.PublicIP == "" {
 		return fmt.Errorf("node has no public IP")
 	}
+	if node.SSHKeyPath == "" {
+		return fmt.Errorf("no SSH key for node %s — destroy and recreate, or place key at ~/.gitmachine/keys/%s.pem", node.ID, node.ID)
+	}
 
 	sshUser := node.SSHUser
 	if sshUser == "" {
@@ -855,6 +860,42 @@ func nodeDeployAgent(args []string) {
 	fmt.Printf("Agent URL: http://%s:9420\n", node.PublicIP)
 }
 
+func nodeSync() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	fmt.Print("Syncing nodes from AWS...")
+	result, state, err := gm.SyncNodesFromAWSWithCreds(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nFailed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(" done!")
+	if len(result.Added) > 0 {
+		fmt.Printf("  Added:   %v\n", result.Added)
+	}
+	if len(result.Updated) > 0 {
+		fmt.Printf("  Updated: %v\n", result.Updated)
+	}
+	if len(result.Added) == 0 && len(result.Updated) == 0 {
+		fmt.Println("  Everything up to date.")
+	}
+
+	// Show the current node list.
+	if state != nil && len(state.Nodes) > 0 {
+		fmt.Println()
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tPROVIDER\tTYPE\tREGION\tIP\tSTATUS\tAGE")
+		for _, n := range state.Nodes {
+			age := time.Since(n.CreatedAt).Truncate(time.Second)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				n.ID, n.Provider, n.InstanceType, n.Region, n.PublicIP, n.Status, formatAge(age))
+		}
+		w.Flush()
+	}
+}
+
 // ==================== helpers ====================
 
 func resolveNode(idOrPrefix string) (*gm.NodeState, *gm.NodeRecord) {
@@ -994,6 +1035,7 @@ func printNodeUsage() {
 	fmt.Println("Commands:")
 	fmt.Println("  create <provider> [type] [region]    Launch a new node")
 	fmt.Println("  list                                 List all nodes")
+	fmt.Println("  sync                                 Discover & sync nodes from AWS")
 	fmt.Println("  status [node-id]                     Show node status")
 	fmt.Println("  stop <node-id>                       Stop a node (preserves disk)")
 	fmt.Println("  start <node-id>                      Start a stopped node")
